@@ -30,11 +30,11 @@ model = model.to(device)
 # SPEEDUP 3: PyTorch 2.0 Compilation (Optional but highly recommended)
 # This analyzes your GNN and fuses operations together to make them run faster.
 # If you get an error with this line on your specific setup, just comment it out.
-try:
-    model = torch.compile(model)
-    print("PyTorch model compilation successful.")
-except Exception as e:
-    print("Skipping torch.compile (requires PyTorch 2.0+).")
+#try:
+#    model = torch.compile(model)
+#    print("PyTorch model compilation successful.")
+#except Exception as e:
+#    print("Skipping torch.compile (requires PyTorch 2.0+).")
 
 optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 loss_fn = torch.nn.MSELoss() 
