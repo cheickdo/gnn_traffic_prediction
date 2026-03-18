@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Traffic Predictor Demo</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+    <style>
+        body { font-family: system-ui, sans-serif; margin: 20px; }
+        #map { height: 600px; width: 100%; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); }
+        .controls { margin-bottom: 20px; }
+        button { padding: 10px 20px; font-size: 16px; cursor: pointer; background: #007bff; color: white; border: none; border-radius: 4px; }
+        button:hover { background: #0056b3; }
+        #status { font-weight: bold; margin-top: 10px; color: #333; }
+    </style>
+</head>
+<body>
+    <div class="controls">
+        <h2>Live Traffic Predictor</h2>
+        <p>Click on the map to set your <b>Origin</b> and <b>Destination</b>.</p>
+        <button onclick="submitRoute()">Predict Traffic Route</button>
+        <div id="status">Waiting for input...</div>
+    </div>
+    <div id="map"></div>
+
+    <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+    <script>
+        // Initialize map centered on Toronto
+        const map = L.map('map').setView([43.6532, -79.3832], 13); 
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
+
+        let origin = null;
+        let destination = null;
+        let originMarker = null;
+        let destMarker = null;
+
+        map.on('click', function(e) {
+            if (!origin) {
+                origin = e.latlng;
+                originMarker = L.marker(origin).addTo(map).bindPopup("Origin").openPopup();
+            } else if (!destination) {
+                destination = e.latlng;
+                destMarker = L.marker(destination).addTo(map).bindPopup("Destination").openPopup();
+                
+                // Draw a simple line between the points
+                L.polyline([origin, destination], {color: 'blue', dashArray: '5, 5'}).addTo(map);
+            } else {
+                // Reset map on third click
+                location.reload(); 
+            }
+        });
+
+        async function submitRoute() {
+            if (!origin || !destination) {
+                document.getElementById('status').innerText = "Please select both an origin and a destination.";
+                return;
+            }
+            
+            document.getElementById('status').innerText = "Routing through GNN backend...";
+            
+            const payload = {
+                origin: { lat: origin.lat, lng: origin.lng },
+                destination: { lat: destination.lat, lng: destination.lng }
+            };
+
+            try {
+                // Point this to your FastAPI backend
+                const response = await fetch('http://localhost:8000/predict', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                
+                if (response.ok) {
+                    const data = await response.json();
+                    document.getElementById('status').innerText = `Prediction: ETA ${data.eta_minutes} mins. Traffic condition: ${data.traffic_state}.`;
+                } else {
+                    document.getElementById('status').innerText = "Error: Backend returned a bad response.";
+                }
+            } catch (error) {
+                document.getElementById('status').innerText = "Error connecting to the backend. Is the server running?";
+            }
+        }
+    </script>
+</body>
+</html>
