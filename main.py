@@ -45,9 +45,9 @@ async def load_ai_assets():
     df1 = pd.read_csv("svc_raw_data_volume_2015_2019.csv")
     df2 = pd.read_csv("svc_raw_data_volume_2020_2024.csv")
     df = pd.concat([df1, df2], ignore_index=True)
-    nodes_df = df.drop_duplicates(subset=['centreline_id'])[['latitude', 'longitude']]
+    nodes_df = df.drop_duplicates(subset=['centreline_id'])[['centreline_id', 'latitude', 'longitude']]
     nodes_df = nodes_df.sort_values('centreline_id').reset_index(drop=True)
-    
+
     node_coords = nodes_df[['latitude', 'longitude']].values
     kdtree = KDTree(node_coords)
 
@@ -71,28 +71,34 @@ class MapRequest(BaseModel):
 @app.post("/predict_map")
 async def predict_full_map(req: MapRequest):
     num_nodes = len(node_coords)
-    
-    # 1. Initialize the current graph state (baseline low traffic)
-    # We use a normalized baseline (e.g., 20/500) so the model has realistic context
     current_state = np.full((num_nodes, 1), 20.0 / MAX_VOLUME)
     
-    # 2. Overlay user-drawn traffic data
+    # 1. Track our bottlenecks so we can keep them active over time
+    bottleneck_indices = []
     for point in req.custom_traffic:
-        # Find the nearest intersection to where the user clicked/drew
         dist, node_idx = kdtree.query([point.lat, point.lng])
-        # Apply the user's custom volume (normalized)
         current_state[node_idx, 0] = min(point.volume / MAX_VOLUME, 1.0)
+        bottleneck_indices.append((node_idx, current_state[node_idx, 0]))
         
-    # Convert to PyTorch tensor
     x = torch.tensor(current_state, dtype=torch.float32).to(device)
     
-    # 3. Run Inference on the whole graph
-    with torch.no_grad():
-        all_predictions = model(x, edge_index, edge_attr)
-        
-    all_predictions = all_predictions.squeeze().cpu().numpy()
+    # 2. THE FIX: Auto-Regressive Loop (Simulate 1 hour / 4 time steps)
+    future_steps = 4 
     
-    # 4. Format output for the frontend map rendering
+    with torch.no_grad():
+        for step in range(future_steps):
+            # Predict the next 15-minute interval
+            x = model(x, edge_index, edge_attr)
+            
+            # Force the original bottlenecks to stay congested
+            # Otherwise, the GNN naturally predicts the jam clears up
+            for idx, initial_vol in bottleneck_indices:
+                x[idx, 0] = initial_vol 
+            
+    # Extract the final state after 1 hour has passed
+    all_predictions = x.squeeze().cpu().numpy()
+    
+    # 3. Format output for the frontend map rendering
     results = []
     for i in range(num_nodes):
         pred_vol = max(0, all_predictions[i] * MAX_VOLUME)
