@@ -1,82 +1,147 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Traffic Predictor Demo</title>
+    <title>Toronto GNN Traffic Predictor</title>
     <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
     <style>
-        body { font-family: system-ui, sans-serif; margin: 20px; }
-        #map { height: 600px; width: 100%; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); }
-        .controls { margin-bottom: 20px; }
-        button { padding: 10px 20px; font-size: 16px; cursor: pointer; background: #007bff; color: white; border: none; border-radius: 4px; }
+        body { font-family: system-ui, sans-serif; margin: 20px; display: flex; flex-direction: column; align-items: center; background: #f4f4f9;}
+        #map { height: 70vh; width: 100%; max-width: 1200px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); margin-top: 20px;}
+        .panel { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); width: 100%; max-width: 1160px; display: flex; gap: 20px; align-items: center;}
+        .control-group { display: flex; flex-direction: column; gap: 5px; }
+        button { padding: 10px 20px; font-size: 16px; font-weight: bold; cursor: pointer; background: #007bff; color: white; border: none; border-radius: 4px; transition: 0.2s;}
         button:hover { background: #0056b3; }
-        #status { font-weight: bold; margin-top: 10px; color: #333; }
+        button.danger { background: #dc3545; }
+        button.danger:hover { background: #c82333; }
+        select { padding: 10px; font-size: 16px; border-radius: 4px; border: 1px solid #ccc; }
+        #status { font-weight: bold; color: #333; margin-left: auto;}
+        
+        /* Legend styling */
+        .legend { background: white; padding: 10px; border-radius: 5px; box-shadow: 0 1px 5px rgba(0,0,0,0.2); line-height: 24px; color: #555; }
+        .legend i { width: 18px; height: 18px; float: left; margin-right: 8px; border-radius: 50%; opacity: 0.8;}
     </style>
 </head>
 <body>
-    <div class="controls">
-        <h2>Live Traffic Predictor</h2>
-        <p>Click on the map to set your <b>Origin</b> and <b>Destination</b>.</p>
-        <button onclick="submitRoute()">Predict Traffic Route</button>
-        <div id="status">Waiting for input...</div>
+
+    <div class="panel">
+        <div class="control-group">
+            <label><b>1. Brush Density</b></label>
+            <select id="density-selector">
+                <option value="400">🛑 Standstill (400+ cars/15m)</option>
+                <option value="250">🟠 Heavy Traffic (250 cars/15m)</option>
+                <option value="100">🟡 Moderate (100 cars/15m)</option>
+            </select>
+        </div>
+        <div class="control-group">
+            <label><b>2. Action</b></label>
+            <p style="margin:0; font-size: 14px; color: #666;">Click map to place traffic.</p>
+        </div>
+        <button onclick="predictMap()">🧠 Predict +15 Mins (GNN)</button>
+        <button class="danger" onclick="clearMap()">🗑️ Clear Map</button>
+        <div id="status">Ready.</div>
     </div>
+
     <div id="map"></div>
 
     <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
     <script>
-        // Initialize map centered on Toronto
-        const map = L.map('map').setView([43.6532, -79.3832], 13); 
-        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
+        // Initialize Map
+        const map = L.map('map').setView([43.68, -79.38], 12); // Wider view of Toronto
+        L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', { 
+            maxZoom: 19,
+            attribution: '&copy; OpenStreetMap &copy; CARTO'
+        }).addTo(map);
 
-        let origin = null;
-        let destination = null;
-        let originMarker = null;
-        let destMarker = null;
+        let userTrafficPoints = [];
+        let userMarkers = L.layerGroup().addTo(map);
+        let predictionLayers = L.layerGroup().addTo(map);
 
-        map.on('click', function(e) {
-            if (!origin) {
-                origin = e.latlng;
-                originMarker = L.marker(origin).addTo(map).bindPopup("Origin").openPopup();
-            } else if (!destination) {
-                destination = e.latlng;
-                destMarker = L.marker(destination).addTo(map).bindPopup("Destination").openPopup();
-                
-                // Draw a simple line between the points
-                L.polyline([origin, destination], {color: 'blue', dashArray: '5, 5'}).addTo(map);
-            } else {
-                // Reset map on third click
-                location.reload(); 
+        // Helper to get colors based on traffic volume
+        function getColor(volume) {
+            return volume > 300 ? '#800026' :
+                   volume > 200 ? '#bd0026' :
+                   volume > 150 ? '#e31a1c' :
+                   volume > 100 ? '#fd8d3c' :
+                   volume > 50  ? '#feb24c' :
+                                  '#fed976';
+        }
+
+        // Add Legend
+        const legend = L.control({position: 'bottomright'});
+        legend.onAdd = function (map) {
+            const div = L.DomUtil.create('div', 'info legend');
+            const grades = [0, 50, 100, 150, 200, 300];
+            div.innerHTML += '<h4>Predicted Vol</h4>';
+            for (let i = 0; i < grades.length; i++) {
+                div.innerHTML +=
+                    '<i style="background:' + getColor(grades[i] + 1) + '"></i> ' +
+                    grades[i] + (grades[i + 1] ? '&ndash;' + grades[i + 1] + '<br>' : '+');
             }
+            return div;
+        };
+        legend.addTo(map);
+
+        // Map Click Event (Drawing Traffic)
+        map.on('click', function(e) {
+            const density = document.getElementById('density-selector').value;
+            
+            // Save data for backend
+            userTrafficPoints.push({
+                lat: e.latlng.lat,
+                lng: e.latlng.lng,
+                volume: parseFloat(density)
+            });
+
+            // Draw user marker
+            L.circleMarker(e.latlng, {
+                radius: 12,
+                fillColor: "black",
+                color: "#fff",
+                weight: 2,
+                opacity: 1,
+                fillOpacity: 0.8
+            }).bindPopup(`Input: ${density} vehicles`).addTo(userMarkers);
         });
 
-        async function submitRoute() {
-            if (!origin || !destination) {
-                document.getElementById('status').innerText = "Please select both an origin and a destination.";
-                return;
-            }
-            
-            document.getElementById('status').innerText = "Routing through GNN backend...";
-            
-            const payload = {
-                origin: { lat: origin.lat, lng: origin.lng },
-                destination: { lat: destination.lat, lng: destination.lng }
-            };
+        function clearMap() {
+            userTrafficPoints = [];
+            userMarkers.clearLayers();
+            predictionLayers.clearLayers();
+            document.getElementById('status').innerText = "Map cleared.";
+        }
+
+        async function predictMap() {
+            document.getElementById('status').innerText = "GNN Computing Spatio-Temporal Propagation...";
+            predictionLayers.clearLayers(); // Clear old predictions
 
             try {
-                // Point this to your FastAPI backend
-                const response = await fetch('http://localhost:8000/predict', {
+                const response = await fetch('http://localhost:8000/predict_map', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload)
+                    body: JSON.stringify({ custom_traffic: userTrafficPoints })
                 });
                 
                 if (response.ok) {
                     const data = await response.json();
-                    document.getElementById('status').innerText = `Prediction: ETA ${data.eta_minutes} mins. Traffic condition: ${data.traffic_state}.`;
+                    
+                    // Render the predictions across the city
+                    data.predictions.forEach(node => {
+                        // Only draw nodes that have notable traffic to avoid cluttering the map
+                        if (node.predicted_volume > 10) {
+                            L.circleMarker([node.lat, node.lng], {
+                                radius: 6,
+                                fillColor: getColor(node.predicted_volume),
+                                color: "transparent",
+                                fillOpacity: 0.7
+                            }).bindPopup(`Predicted: ${node.predicted_volume} veh/15min`).addTo(predictionLayers);
+                        }
+                    });
+
+                    document.getElementById('status').innerText = "Prediction complete!";
                 } else {
-                    document.getElementById('status').innerText = "Error: Backend returned a bad response.";
+                    document.getElementById('status').innerText = "Error: Backend processing failed.";
                 }
             } catch (error) {
-                document.getElementById('status').innerText = "Error connecting to the backend. Is the server running?";
+                document.getElementById('status').innerText = "Error connecting to backend.";
             }
         }
     </script>
