@@ -1,114 +1,169 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>Toronto Traffic GNN</title>
-    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <meta charset="UTF-8">
+    <title>AI ETA Predictor</title>
+    <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
+    <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
+    <script src="https://unpkg.com/deck.gl@8.9.0/dist.min.js"></script>
     <style>
-        body { font-family: system-ui, sans-serif; margin: 20px; background-color: #f8f9fa; }
-        #map { height: 700px; width: 100%; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); border: 1px solid #ddd; }
-        .controls { margin-bottom: 20px; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.05); }
-        h2 { margin-top: 0; color: #333; }
-        button { padding: 10px 20px; font-size: 16px; cursor: pointer; background: #007bff; color: white; border: none; border-radius: 4px; margin-right: 10px; font-weight: bold; transition: background 0.2s;}
-        button:hover { background: #0056b3; }
-        button.clear { background: #dc3545; }
-        button.clear:hover { background: #c82333; }
-        #status { font-weight: bold; margin-top: 15px; color: #555; }
+        body { margin: 0; padding: 0; font-family: 'Segoe UI', system-ui, sans-serif; background: #0b0f19; overflow: hidden; color: #fff; }
+        #map { width: 100vw; height: 100vh; position: absolute; top: 0; left: 0; }
+        #panel { position: absolute; top: 20px; left: 20px; background: rgba(15, 20, 35, 0.95); padding: 25px; border-radius: 12px; border: 1px solid #334; z-index: 10; width: 340px; box-shadow: 0 10px 40px rgba(0,0,0,0.9); backdrop-filter: blur(10px); }
+        h2 { margin: 0 0 5px 0; font-size: 20px; color: #00d2ff; }
+        p { color: #8892b0; font-size: 13px; margin-bottom: 20px; line-height: 1.5; }
+        .tools { display: grid; grid-template-columns: 1fr; gap: 8px; margin-bottom: 20px; }
+        button { padding: 12px; font-size: 14px; cursor: pointer; background: #1e293b; color: #fff; border: 1px solid #475569; border-radius: 6px; font-weight: 600; transition: 0.2s; text-align: left;}
+        button:hover { background: #334155; }
+        button.active { background: #00d2ff; color: #000; border-color: #00d2ff; }
+        
+        .btn-predict { width: 100%; background: #10b981; color: #000; border: none; font-size: 16px; padding: 15px; text-align: center; margin-bottom: 10px; }
+        .btn-predict:hover { background: #059669; box-shadow: 0 0 15px rgba(16, 185, 129, 0.4); }
+        .btn-clear { width: 100%; background: transparent; border: 1px dashed #64748b; color: #94a3b8; text-align: center; }
+        
+        #eta-dashboard { display: none; margin-top: 20px; padding: 15px; background: rgba(0,0,0,0.5); border-radius: 8px; border: 1px solid #334; }
+        .eta-title { font-size: 11px; color: #94a3b8; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 5px; }
+        .eta-value { font-size: 32px; font-weight: bold; color: #00d2ff; margin-bottom: 15px; }
+        .eta-sub { font-size: 14px; color: #ef4444; }
+        
+        #status { margin-top: 15px; font-size: 12px; color: #10b981; text-align: center; }
     </style>
 </head>
 <body>
-    <div class="controls">
-        <h2>Toronto GNN Traffic Predictor</h2>
-        <p>Click on the map to inject custom traffic bottlenecks, then run the GNN to predict how the network responds.</p>
-        <button onclick="submitGraph()">Predict Full Map Traffic</button>
-        <button class="clear" onclick="clearMap()">Clear Map</button>
-        <div id="status">Waiting for user input...</div>
-    </div>
-    
     <div id="map"></div>
-
-    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-    <script>
-        // 1. THE FIX: Force Leaflet to load default icons directly from the CDN
-        delete L.Icon.Default.prototype._getIconUrl;
-        L.Icon.Default.mergeOptions({
-            iconRetinaUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon-2x.png',
-            iconUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png',
-            shadowUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png',
-        });
-
-        // Initialize map centered on Toronto
-        const map = L.map('map').setView([43.665, -79.3832], 13);
+    <div id="panel">
+        <h2>AI ETA Engine</h2>
+        <p>NPU spatial matrix prediction for real-time dynamic pathfinding.</p>
         
-        // Use a darker, cleaner map style to make the traffic colors pop
-        L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', { 
-            maxZoom: 19,
-            attribution: '&copy; OpenStreetMap contributors &copy; CARTO'
-        }).addTo(map);
+        <div class="tools">
+            <button id="btn-jam" class="active" onclick="setMode('jam')">🚧 1. Draw Congestion</button>
+            <button id="btn-start" onclick="setMode('start')">🟢 2. Set Origin</button>
+            <button id="btn-end" onclick="setMode('end')">🔴 3. Set Destination</button>
+        </div>
+        
+        <button class="btn-predict" onclick="predictETA()">🚀 Calculate ETA</button>
+        <button class="btn-clear" onclick="clearMap()">Reset Map</button>
+        
+        <div id="eta-dashboard">
+            <div class="eta-title">AI Smart Route (Detour)</div>
+            <div class="eta-value" id="ai-time">-- min</div>
+            
+            <div class="eta-title">Standard Route (Direct)</div>
+            <div class="eta-sub" id="std-time">-- min</div>
+        </div>
+        
+        <div id="status">Ready for input.</div>
+    </div>
 
+    <script>
+        const {DeckGL, PathLayer, ScatterplotLayer, HeatmapLayer} = deck;
+
+        let currentMode = 'jam';
         let inputMarkers = [];
-        let predictionLayer = L.layerGroup().addTo(map);
+        let startMarker = null;
+        let endMarker = null;
+        
+        let heatmapData = [];
+        let aiRouteData = [];
+        let stdRouteData = [];
 
-        // Click to add a traffic bottleneck
-        map.on('click', function(e) {
-            const marker = L.marker(e.latlng).addTo(map).bindPopup("Simulated Bottleneck").openPopup();
-            // We assign a high default volume (e.g. 450) to wherever the user clicks
-            inputMarkers.push({ marker: marker, lat: e.latlng.lat, lng: e.latlng.lng, volume: 450.0 }); 
+        const deckgl = new DeckGL({
+            container: 'map',
+            mapStyle: 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json',
+            initialViewState: { longitude: -79.3832, latitude: 43.655, zoom: 13.5, pitch: 45, bearing: -10 },
+            controller: true,
+            onClick: (info) => handleMapClick(info.coordinate)
         });
+
+        function setMode(mode) {
+            currentMode = mode;
+            ['jam', 'start', 'end'].forEach(m => document.getElementById(`btn-${m}`).classList.remove('active'));
+            document.getElementById(`btn-${mode}`).classList.add('active');
+        }
+
+        function handleMapClick(coords) {
+            if (!coords) return;
+            const [lng, lat] = coords;
+            if (currentMode === 'jam') inputMarkers.push({ position: [lng, lat], color: [255, 50, 50] });
+            else if (currentMode === 'start') startMarker = { position: [lng, lat], color: [16, 185, 129] };
+            else if (currentMode === 'end') endMarker = { position: [lng, lat], color: [139, 92, 246] };
+            renderLayers();
+        }
 
         function clearMap() {
-            inputMarkers.forEach(m => map.removeLayer(m.marker));
-            inputMarkers = [];
-            predictionLayer.clearLayers();
+            inputMarkers = []; startMarker = null; endMarker = null;
+            heatmapData = []; aiRouteData = []; stdRouteData = [];
+            document.getElementById('eta-dashboard').style.display = 'none';
             document.getElementById('status').innerText = "Map cleared.";
+            renderLayers();
         }
 
-        // Color gradient logic for the traffic nodes
-        function getColor(volume) {
-            if (volume < 50) return "#28a745"; // Green (Clear)
-            if (volume < 150) return "#ffc107"; // Yellow (Moderate)
-            return "#dc3545"; // Red (Heavy Congestion)
+        function renderLayers() {
+            deckgl.setProps({
+                layers: [
+                    // Heatmap replaces the 3D columns for a sleeker "Traffic Radar" look
+                    new HeatmapLayer({
+                        id: 'congestion-heat',
+                        data: heatmapData,
+                        getPosition: d => [d.lng, d.lat],
+                        getWeight: d => d.congestion,
+                        radiusPixels: 40,
+                        intensity: 2,
+                        threshold: 0.1,
+                        colorRange: [ [255, 204, 0, 50], [255, 100, 0, 150], [255, 0, 0, 255] ]
+                    }),
+                    new ScatterplotLayer({
+                        id: 'inputs', data: [...inputMarkers, startMarker, endMarker].filter(Boolean),
+                        getPosition: d => d.position, getFillColor: d => d.color, getRadius: 35, radiusMinPixels: 6
+                    }),
+                    new PathLayer({
+                        id: 'std-route', data: stdRouteData, widthScale: 4, widthMinPixels: 3,
+                        getPath: d => d.path, getColor: [239, 68, 68, 200], getWidth: 2, // Red line driving into traffic
+                        dashJustified: true, getDashArray: [4, 2] 
+                    }),
+                    new PathLayer({
+                        id: 'ai-route', data: aiRouteData, widthScale: 4, widthMinPixels: 6,
+                        getPath: d => d.path, getColor: [0, 210, 255, 255], getWidth: 4 // Thick blue detour
+                    })
+                ]
+            });
         }
 
-        async function submitGraph() {
-            document.getElementById('status').innerText = "Running GNN Inference on backend...";
-            predictionLayer.clearLayers(); // Clear old predictions
+        async function predictETA() {
+            if (!startMarker || !endMarker) {
+                document.getElementById('status').innerText = "⚠️ Missing Start or End Point!";
+                return;
+            }
 
-            // Format the payload to match the MapRequest Pydantic model
+            document.getElementById('status').innerText = "Calculating AI Matrix...";
             const payload = {
-                custom_traffic: inputMarkers.map(m => ({ lat: m.lat, lng: m.lng, volume: m.volume }))
+                custom_traffic: inputMarkers.map(m => ({ lat: m.position[1], lng: m.position[0] })),
+                start_pt: { lat: startMarker.position[1], lng: startMarker.position[0] },
+                end_pt: { lat: endMarker.position[1], lng: endMarker.position[0] }
             };
 
             try {
-                const response = await fetch('http://localhost:8000/predict_map', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload)
+                const response = await fetch('http://localhost:8000/predict_route', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
                 });
 
                 if (response.ok) {
                     const data = await response.json();
                     
-                    // 2. THE FIX: Loop through the massive array of predictions and draw them
-                    data.predictions.forEach(node => {
-                        const color = getColor(node.predicted_volume);
-                        L.circleMarker([node.lat, node.lng], {
-                            radius: 6,
-                            fillColor: color,
-                            color: "#fff", // White border
-                            weight: 1,
-                            opacity: 1,
-                            fillOpacity: 0.8
-                        }).addTo(predictionLayer)
-                          .bindPopup(`Predicted Volume: ${node.predicted_volume} vehicles/15min`);
-                    });
+                    heatmapData = data.predictions;
+                    if (data.travel.std_route.length > 0) stdRouteData = [{ path: data.travel.std_route.map(p => [p.lng, p.lat]) }];
+                    if (data.travel.ai_route.length > 0) aiRouteData = [{ path: data.travel.ai_route.map(p => [p.lng, p.lat, 50]) }];
 
-                    document.getElementById('status').innerText = `Successfully predicted traffic for ${data.predictions.length} intersections!`;
-                } else {
-                    document.getElementById('status').innerText = "Error: Backend returned a bad response.";
+                    // Update Dashboard
+                    document.getElementById('eta-dashboard').style.display = 'block';
+                    document.getElementById('ai-time').innerText = `${data.travel.ai_time_min} Minutes`;
+                    document.getElementById('std-time').innerText = `${data.travel.standard_time_min} Minutes`;
+                    
+                    renderLayers();
+                    document.getElementById('status').innerText = "Prediction Complete!";
                 }
             } catch (error) {
-                console.error(error);
-                document.getElementById('status').innerText = "Error connecting to the backend. Is FastAPI running?";
+                document.getElementById('status').innerText = "Backend Connection Error.";
             }
         }
     </script>

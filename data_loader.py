@@ -1,105 +1,109 @@
 import pandas as pd
 import numpy as np
-from scipy.spatial import distance
+from scipy.spatial import KDTree
 from torch_geometric_temporal.signal import StaticGraphTemporalSignal
 
-def create_edge_index_from_coords(coords_df, distance_threshold=0.02):
-    """
-    Creates an adjacency matrix (edges) by connecting intersections 
-    that are geographically close to each other.
-    """
-    print("Building road network graph from coordinates...")
+def create_edge_index_from_coords(coords_df, k=8):
+    print("Building road network using K-Nearest Neighbors...")
     coords_array = coords_df[['latitude', 'longitude']].values
-    
-    # Calculate Euclidean distance between all pairs of intersections
-    dist_matrix = distance.cdist(coords_array, coords_array, 'euclidean')
-    
+    num_nodes = len(coords_array)
+    k_query = min(k + 1, num_nodes)
+
+    tree = KDTree(coords_array)
+    distances, indices = tree.query(coords_array, k=k_query)
+
     edge_index_list = []
     edge_weights_list = []
-    
-    num_nodes = len(coords_array)
+
     for i in range(num_nodes):
-        for j in range(num_nodes):
-            if i != j:  # Don't connect a node to itself
-                dist = dist_matrix[i, j]
-                if dist < distance_threshold:
-                    # Create a directional edge from node i to node j
-                    edge_index_list.append([i, j])
-                    # Weight is inversely proportional to distance (closer = stronger connection)
-                    edge_weights_list.append(1.0 / (dist + 1e-5))
-                    
-    edge_index = np.array(edge_index_list).T # PyG expects shape (2, num_edges)
-    edge_weights = np.array(edge_weights_list)
-    
+        for j in range(1, k_query):
+            neighbor_idx = int(indices[i, j])
+            dist = float(distances[i, j])
+            edge_index_list.append([i, neighbor_idx])
+            edge_weights_list.append(1.0 / (dist + 1e-5))
+
+    edge_index = np.array(edge_index_list, dtype=np.int64).T
+    edge_weights = np.array(edge_weights_list, dtype=np.float64)
+
+    # Undirected message passing
+    rev = edge_index[[1, 0], :]
+    edge_index = np.concatenate([edge_index, rev], axis=1)
+    edge_weights = np.concatenate([edge_weights, edge_weights])
+
     return edge_index, edge_weights
 
 def load_toronto_traffic_data():
-    print("Loading raw CSV files (This might take a moment)...")
+    print("Loading Real Speed Data (This might take a moment)...")
     
-    # 1. Load the volume datasets
-    file1 = "svc_raw_data_volume_2015_2019.csv"
-    file2 = "svc_raw_data_volume_2020_2024.csv"
+    # NEW: Read the speed dataset
+    df = pd.read_csv("svc_raw_data_speed_2020_2024.csv")
     
-    df1 = pd.read_csv(file1)
-    df2 = pd.read_csv(file2)
+    # Downtown Bounding Box Filter
+    LAT_MIN, LAT_MAX = 43.640, 43.675  
+    LNG_MIN, LNG_MAX = -79.410, -79.355 
     
-    # Combine the datasets into one large DataFrame
-    df = pd.concat([df1, df2], ignore_index=True)
+    df = df[(df['latitude'] >= LAT_MIN) & (df['latitude'] <= LAT_MAX) & 
+            (df['longitude'] >= LNG_MIN) & (df['longitude'] <= LNG_MAX)].copy()
     
-    print(f"Loaded {len(df)} total traffic records.")
+    print(f"Filtered for Downtown Core. Remaining records: {len(df)}")
 
-    # 2. Extract unique nodes (Intersections) and their coordinates
+    # Define the midpoint speeds for each bin (in km/h)
+    speed_bins = {
+        'vol_1_19kph': 10.0,
+        'vol_20_25kph': 22.5,
+        'vol_26_30kph': 28.0,
+        'vol_31_35kph': 33.0,
+        'vol_36_40kph': 38.0,
+        'vol_41_45kph': 43.0,
+        'vol_46_50kph': 48.0,
+        'vol_51_55kph': 53.0,
+        'vol_56_60kph': 58.0,
+        'vol_61_65kph': 63.0,
+        'vol_66_70kph': 68.0,
+        'vol_71_75kph': 73.0,
+        'vol_76_80kph': 78.0,
+        'vol_81_160kph': 90.0 # Cap outliers to 90 for averages
+    }
+
+    # 1. Calculate Total Volume
+    df['total_volume'] = df[list(speed_bins.keys())].sum(axis=1)
+    
+    # 2. Calculate Weighted Average Speed
+    # (vol * speed) + (vol * speed) / total_vol
+    weighted_sum = sum(df[col] * speed for col, speed in speed_bins.items())
+    df['avg_speed_kmh'] = np.where(df['total_volume'] > 0, weighted_sum / df['total_volume'], 40.0)
+
+    # 3. Calculate Congestion Index (0.0 = Free Flow, 1.0 = Gridlock)
+    # Assuming baseline max speed is 40km/h
+    df['congestion_index'] = 1.0 - (df['avg_speed_kmh'] / 40.0)
+    df['congestion_index'] = df['congestion_index'].clip(lower=0.0, upper=1.0)
+
+    # Extract unique nodes
     nodes_df = df.drop_duplicates(subset=['centreline_id'])[['centreline_id', 'latitude', 'longitude']]
     nodes_df = nodes_df.sort_values('centreline_id').reset_index(drop=True)
     node_ids = nodes_df['centreline_id'].tolist()
-    print(f"Found {len(node_ids)} unique intersections.")
+    print(f"Found {len(node_ids)} unique downtown speed intersections.")
 
-    # 3. Build the Graph Edges based on proximity
-    edge_index, edge_weights = create_edge_index_from_coords(nodes_df, distance_threshold=0.03)
-    print(f"Created {edge_index.shape[1]} edges between intersections.")
+    edge_index, edge_weights = create_edge_index_from_coords(nodes_df, k=8)
 
-    # 4. Process Temporal Features (The Traffic Volumes)
+    # Pivot into Time-Series using the new Congestion Index
     print("Pivoting data into time-series format...")
-    # Group by time step and intersection, summing the traffic volume
-    grouped = df.groupby(['time_start', 'centreline_id'])['volume_15min'].sum().reset_index()
+    grouped = df.groupby(['time_start', 'centreline_id'])['congestion_index'].mean().reset_index()
+    pivot_df = grouped.pivot(index='time_start', columns='centreline_id', values='congestion_index')
+    pivot_df = pivot_df.reindex(columns=node_ids, fill_value=0.0)
+    pivot_df = pivot_df.fillna(0.0) # 0.0 means free flowing traffic
     
-    # Pivot so Rows = Time Steps, Columns = Intersections
-    pivot_df = grouped.pivot(index='time_start', columns='centreline_id', values='volume_15min')
+    raw_congestion = pivot_df.values
+    num_time_steps = raw_congestion.shape[0]
+    num_nodes = raw_congestion.shape[1]
     
-    # Ensure all nodes exist in the pivot table, even if they had no traffic at a specific time
-    pivot_df = pivot_df.reindex(columns=node_ids, fill_value=0)
-    
-    # Fill missing time intervals with 0 (No traffic recorded)
-    pivot_df = pivot_df.fillna(0)
-    
-    print(f"Processed {len(pivot_df)} unique 15-minute time steps.")
-
-    # 5. Format into NumPy arrays for the GNN
-    # Features shape required: (num_time_steps, num_nodes, num_features)
-    raw_volumes = pivot_df.values
-    num_time_steps = raw_volumes.shape[0]
-    num_nodes = raw_volumes.shape[1]
-    num_features = 1 # We are only tracking 'volume_15min'
-    
-    features = raw_volumes.reshape((num_time_steps, num_nodes, num_features))
-    
-    # Target shape required: (num_time_steps, num_nodes)
-    # The target is to predict the traffic volume of the *next* time step
+    features = raw_congestion.reshape((num_time_steps, num_nodes, 1))
     targets = np.zeros((num_time_steps, num_nodes))
-    targets[:-1, :] = raw_volumes[1:, :] # Shift everything up by 1 time step
+    targets[:-1, :] = raw_congestion[1:, :] 
     
-    # Note: The very last time step won't have a "next" target, so we drop it
     features = features[:-1]
     targets = targets[:-1]
 
-    # Normalize the data (Neural networks train much better on scaled numbers 0 to 1)
-    max_vol = np.max(features)
-    if max_vol > 0:
-        features = features / max_vol
-        targets = targets / max_vol
-
-    # 6. Wrap it in the PyG Temporal Iterator
-    print("Packaging into StaticGraphTemporalSignal...")
     dataset = StaticGraphTemporalSignal(
         edge_index=edge_index,
         edge_weight=edge_weights,
@@ -109,7 +113,6 @@ def load_toronto_traffic_data():
     
     return dataset
 
-# For testing this script directly:
 if __name__ == "__main__":
     dataset = load_toronto_traffic_data()
-    print("Data loaded successfully!")
+    print("Real Speed Data loaded and normalized successfully!")

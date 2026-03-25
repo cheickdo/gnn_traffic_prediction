@@ -24,8 +24,10 @@ print(f"Hardware Accelerator enabled: {device}")
 model = TrafficPredictorGNN(node_features=NODE_FEATURES, hidden_dim=HIDDEN_DIM)
 model = model.to(device)
 
-optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-loss_fn = torch.nn.MSELoss() 
+optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
+loss_fn = torch.nn.MSELoss()
+
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
 
 # --- 4. Training Loop ---
 def train_model(dataset):
@@ -68,11 +70,12 @@ def train_model(dataset):
             
         # Protect against dividing by zero if an epoch had no data at all
         avg_loss = total_loss / step if step > 0 else 0 
+        scheduler.step(avg_loss) # <-- NEW: Tell the scheduler what the loss was
         
-        # Print progress every 5 epochs
+        current_lr = optimizer.param_groups[0]['lr']
         if epoch % 5 == 0 or epoch == EPOCHS - 1:
             elapsed = time.time() - start_time
-            print(f"Epoch {epoch:02d} | Average Masked MSE Loss: {avg_loss:.4f} | Time: {elapsed:.1f}s")
+            print(f"Epoch {epoch:02d} | LR: {current_lr:.5f} | Masked MSE Loss: {avg_loss:.4f} | Time: {elapsed:.1f}s")
             
     print("\nTraining Complete!")
     
