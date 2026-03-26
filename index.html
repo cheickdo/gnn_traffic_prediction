@@ -43,7 +43,7 @@
         
         #tooltip { position: absolute; z-index: 999; pointer-events: none; display: none; background: rgba(15, 20, 35, 0.95); padding: 8px 12px; border: 1px solid #475569; border-radius: 6px; color: #fff; font-size: 12px; font-family: monospace; box-shadow: 0 4px 15px rgba(0,0,0,0.5); backdrop-filter: blur(4px); transform: translate(-50%, -120%); white-space: nowrap;}
         
-        .legend-dot { display: inline-block; width: 10px; height: 10px; margin-right: 5px; vertical-align: middle; border-width: 1px; border-style: solid;}
+        .legend-dot { display: inline-block; width: 10px; height: 10px; background: rgba(0, 210, 255, 0.2); border: 1px solid #00d2ff; margin-right: 5px; vertical-align: middle; }
     </style>
 </head>
 <body>
@@ -54,9 +54,8 @@
         <h2>AI ETA Engine</h2>
         <p>
             NPU spatial matrix prediction for real-time dynamic pathfinding.<br>
-            <span style="font-size: 11px; color: #94a3b8; display: block; margin-top: 8px; line-height: 2;">
-                <span class="legend-dot" style="background: rgba(0, 210, 255, 0.2); border-color: #00d2ff;"></span>Valid AI Training Zone (Core)<br>
-                <span class="legend-dot" style="background: rgba(148, 163, 184, 0.5); border-color: #94a3b8; border-radius: 50%;"></span>Hardware Node
+            <span style="font-size: 11px; color: #94a3b8; display: block; margin-top: 8px;">
+                <span class="legend-dot"></span>Valid AI Training Zone
             </span>
         </p>
         
@@ -92,20 +91,16 @@
         let aiRouteData = [];
         let stdRouteData = [];
 
-        // Hardware Node State
-        let hardwareNodes = [];
-        let hardwareNodesLayerData = [];
-
         const tooltip = document.getElementById('tooltip');
 
-        // Original 1x Trained Blue Box (Dense Downtown Core)
+        // FIXED: The polygon ring is now explicitly closed to prevent WebGL validation errors
         const boundingBoxData = [{
             polygon: [
                 [-79.395, 43.643], 
                 [-79.395, 43.658], 
                 [-79.370, 43.658], 
                 [-79.370, 43.643],
-                [-79.395, 43.643] 
+                [-79.395, 43.643] // Explicit closing coordinate
             ]
         }];
 
@@ -128,44 +123,13 @@
             controller: true,
             onClick: (info) => handleMapClick(info.coordinate),
             onHover: (info) => handleHover(info),
+            // FIXED: Native DeckGL lifecycle hook instead of invalid .on() event listener
             onLoad: () => triggerRender() 
         });
 
-        // FETCH AND SNAP LOGIC
-        async function fetchHardwareNodes() {
-            try {
-                const response = await fetch('http://localhost:8000/valid_nodes');
-                const data = await response.json();
-                hardwareNodes = data.nodes;
-                
-                // Create faint grey dots to show the user exactly where the network exists
-                hardwareNodesLayerData = hardwareNodes.map(n => ({
-                    position: [n.lng, n.lat],
-                    color: [148, 163, 184, 80] // Slate grey, semi-transparent
-                }));
-                triggerRender();
-            } catch (error) {
-                console.error("Failed to load hardware nodes:", error);
-            }
-        }
-        fetchHardwareNodes();
-
-        function snapToNearestNode(lng, lat) {
-            if (hardwareNodes.length === 0) return [lng, lat];
-            
-            let nearest = null;
-            let minDist = Infinity;
-            
-            // Standard Euclidean distance calculation to find the closest valid pin
-            for (const node of hardwareNodes) {
-                const dist = Math.pow(node.lng - lng, 2) + Math.pow(node.lat - lat, 2);
-                if (dist < minDist) {
-                    minDist = dist;
-                    nearest = [node.lng, node.lat];
-                }
-            }
-            return nearest;
-        }
+        let isShiftDown = false;
+        window.addEventListener('keydown', e => { if (e.key === 'Shift') isShiftDown = true; });
+        window.addEventListener('keyup', e => { if (e.key === 'Shift') isShiftDown = false; });
 
         function setMode(mode) {
             currentMode = mode;
@@ -183,13 +147,11 @@
                 tooltip.style.display = 'none';
             }
 
-            if (info.srcEvent && info.srcEvent.shiftKey && currentMode === 'jam' && info.coordinate) {
-                // SNAP HOVER DRAWING
-                const [lng, lat] = snapToNearestNode(info.coordinate[0], info.coordinate[1]);
+            if (isShiftDown && currentMode === 'jam' && info.coordinate) {
+                const [lng, lat] = info.coordinate;
                 const lastMarker = inputMarkers[inputMarkers.length - 1];
                 
-                // Only push a new marker if we snapped to a DIFFERENT node than the last one
-                if (!lastMarker || lastMarker.position[0] !== lng || lastMarker.position[1] !== lat) {
+                if (!lastMarker || Math.abs(lastMarker.position[0] - lng) > 0.0005 || Math.abs(lastMarker.position[1] - lat) > 0.0005) {
                     inputMarkers.push({ position: [lng, lat], color: [255, 50, 50] });
                     triggerRender();
                 }
@@ -198,9 +160,7 @@
 
         function handleMapClick(coords) {
             if (!coords) return;
-            // SNAP CLICK INPUTS
-            const [lng, lat] = snapToNearestNode(coords[0], coords[1]);
-            
+            const [lng, lat] = coords;
             if (currentMode === 'jam') inputMarkers.push({ position: [lng, lat], color: [255, 50, 50] });
             else if (currentMode === 'start') startMarker = { position: [lng, lat], color: [16, 185, 129] };
             else if (currentMode === 'end') endMarker = { position: [lng, lat], color: [139, 92, 246] };
@@ -223,7 +183,6 @@
 
             deckgl.setProps({
                 layers: [
-                    // Original 1x Trained Blue Box
                     new PolygonLayer({
                         id: 'bounding-box',
                         data: boundingBoxData,
@@ -235,16 +194,6 @@
                         getLineColor: [0, 210, 255, 150], 
                         getLineWidth: 2,
                         lineWidthUnits: 'pixels'
-                    }),
-                    // Hardware Node Visualizer Layer
-                    new ScatterplotLayer({
-                        id: 'hardware-base-nodes', 
-                        data: hardwareNodesLayerData, 
-                        getPosition: d => d.position, 
-                        getFillColor: d => d.color, 
-                        getRadius: 25, 
-                        radiusMinPixels: 4,
-                        pickable: false
                     }),
                     new HeatmapLayer({
                         id: 'congestion-heat',
@@ -265,16 +214,28 @@
                         pickable: true
                     }),
                     new PathLayer({
-                        id: 'std-route', 
-                        data: stdRouteData, 
-                        widthScale: 4, widthMinPixels: 3,
-                        getPath: d => d.path, getColor: [239, 68, 68, 200], getWidth: 2
+                        id: 'std-route',
+                        data: stdRouteData,
+                        widthMinPixels: 3,
+                        widthMaxPixels: 8,
+                        getPath: d => d.path,
+                        getColor: [239, 68, 68, 180],
+                        getWidth: 4,
+                        jointRounded: true,
+                        capRounded: true,
+                        billboard: false
                     }),
                     new PathLayer({
-                        id: 'ai-route', 
-                        data: aiRouteData, 
-                        widthScale: 4, widthMinPixels: 6,
-                        getPath: d => d.path, getColor: [0, 210, 255, 255], getWidth: 4
+                        id: 'ai-route',
+                        data: aiRouteData,
+                        widthMinPixels: 5,
+                        widthMaxPixels: 14,
+                        getPath: d => d.path,
+                        getColor: [0, 210, 255, 255],
+                        getWidth: 7,
+                        jointRounded: true,
+                        capRounded: true,
+                        billboard: false
                     })
                 ]
             });
@@ -312,16 +273,30 @@
                     
                     heatmapData = data.predictions || [];
                     
-                    if (data.travel?.std_route?.length > 0) stdRouteData = [{ path: data.travel.std_route.map(p => [p.lng, p.lat]) }];
-                    if (data.travel?.ai_route?.length > 0) aiRouteData = [{ path: data.travel.ai_route.map(p => [p.lng, p.lat, 50]) }];
+                    // FIX: Use 2-D coordinates [lng, lat] for both routes.
+                    // The previous AI route used [lng, lat, 50] — at 45° pitch that 50 m
+                    // altitude makes the path float above the map and appear to slice
+                    // diagonally across roads.  Both routes must stay on the ground plane.
+                    if (data.travel?.std_route?.length > 0)
+                        stdRouteData = [{ path: data.travel.std_route.map(p => [p.lng, p.lat]) }];
+                    if (data.travel?.ai_route?.length > 0)
+                        aiRouteData  = [{ path: data.travel.ai_route.map(p => [p.lng, p.lat]) }];
 
                     document.getElementById('eta-dashboard').style.display = 'block';
                     document.getElementById('ai-time').innerText = `${data.travel.ai_time_min} Minutes`;
                     document.getElementById('std-time').innerText = `${data.travel.standard_time_min} Minutes`;
-                    
+
                     triggerRender();
-                    statusBox.innerText = "Prediction Complete!";
-                    statusBox.style.color = "#10b981";
+                    const src = data.inference_source === 'npu' ? '⚡ NPU' : '🧠 PyTorch';
+                    const routeOk = !data.routing_status || data.routing_status === 'ok';
+                    if (routeOk) {
+                        statusBox.innerText = `Prediction Complete! [${src}]`;
+                        statusBox.style.color = "#10b981";
+                    } else {
+                        // Routing fell back to haversine straight-line estimate
+                        statusBox.innerText = `Heatmap ready [${src}] — route estimate only (no map path)`;
+                        statusBox.style.color = "#f59e0b";
+                    }
                 } else {
                     statusBox.innerText = "Error: Failed to process route.";
                     statusBox.style.color = "#ef4444";
