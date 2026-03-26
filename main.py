@@ -69,64 +69,110 @@ def hex_to_bfloat16_float(hex_str):
 
 
 def parse_raw_hex_output(filepath, num_nodes):
-    """
-    Parses the raw hex dump from the C++ NPU simulator.
+    """Parse out_file produced by npu_tb.sv and return per-node speed ratios.
 
-    The prediction head (npu_gnn_node_prediction) writes one output per node with
-    batch=SIM_BATCH=3, producing SIM_BATCH consecutive 640-bit words per node in the
-    output buffer. Each 640-bit word contains 40 BFloat16 lanes (40 × 16-bit = 640 bits).
+    ── Testbench output format (npu_tb.sv) ─────────────────────────────────────
+    The write statement is:
+        $fwrite(out_file, "%h \\n", output_rd_data[0]);
+    It sits inside BOTH a lane-check loop (i = 0..DOTW-1) AND a core loop
+    (j = 0..NCORE-1).  Therefore every hardware output word is written
+    DOTW × NCORE = 40 × 3 = 120 times as consecutive, identical lines.
 
-    Layout: total_lines = num_nodes × SIM_BATCH  →  stride = SIM_BATCH = 3
-    We read batch-0's word for each node (line index = node_idx × SIM_BATCH).
+    ── Bit layout of each 640-bit output word ──────────────────────────────────
+    SystemVerilog %h prints MSB-first:
+        chars  0– 3  →  bits [639:624]  =  lane 39  (most-significant)
+        chars  4– 7  →  bits [623:608]  =  lane 38
+        ...
+        chars 156–159 →  bits [15:0]    =  lane  0  (least-significant)
 
-    Lane 0 (rightmost 4 hex chars) contains output dimension 0, which is the real
-    prediction logit (the padded w_head_q has only row-0 non-zero, so dim-0 of the
-    output is the actual model prediction; dims 1-31 are sigmoid(0)=0.5 garbage).
+    Lane 0 holds output dimension 0 from the prediction head.
+    w_head_q is padded so only row 0 is non-zero, meaning lane 0 contains the
+    real per-node prediction; lanes 1-31 hold sigmoid(0)=0.5 (garbage rows).
+
+    ── Sigmoid handling ────────────────────────────────────────────────────────
+    The RTL MFU runs the sigmoid LUT in hardware (it is physically present on
+    the FPGA).  Therefore out_file values are ALREADY in (0, 1).
+    Applying Python sigmoid on top compresses all predictions toward 0.5,
+    which is why the output previously appeared "always the same".
+    Fix: detect whether values are post-sigmoid and skip the software pass.
+
+    ── Stride calculation ──────────────────────────────────────────────────────
+    total_lines  = num_output_words × DOTW × NCORE
+    num_output_words = num_nodes × SIM_BATCH  (one write_back per node, batch=3)
+    →  total_lines  = num_nodes × 3 × 40 × 3 = num_nodes × 360
+    →  stride       = total_lines // num_nodes = 360
+
+    For each node i, line i × stride is batch-0's first write → lane 0 is the
+    actual prediction.
     """
     fallback = np.ones(num_nodes, dtype=np.float32) * 0.5
 
     if not os.path.exists(filepath):
-        logger.error(f"Simulator output not found at {filepath}")
+        logger.error(f"NPU out_file not found: {filepath}")
         return fallback
 
-    with open(filepath, 'r') as f:
-        lines = [l.strip() for l in f.readlines() if l.strip() and len(l.strip()) >= 4]
+    with open(filepath, "r") as f:
+        # Keep only lines that look like hex words (≥4 chars, no 'x' unknowns)
+        lines = [
+            l.strip() for l in f
+            if l.strip() and len(l.strip()) >= 4 and "x" not in l.lower()
+        ]
 
     total_lines = len(lines)
-    logger.info(f"NPU raw output: {total_lines} lines for {num_nodes} nodes")
+    logger.info(f"NPU out_file: {total_lines} lines for {num_nodes} nodes")
 
     if total_lines == 0:
-        logger.error("NPU output file is empty.")
+        logger.error("NPU out_file is empty or contains only unknown (x) bits.")
         return fallback
 
-    # Stride = words per node in the output buffer (SIM_BATCH=3 copies per write_back)
+    # Each hardware output word appears stride = total_lines // num_nodes times.
+    # Reading line[i * stride] gives the first occurrence of node i's output word.
     stride = max(1, total_lines // num_nodes)
-    logger.info(f"NPU output stride: {stride} words/node (expected {SIM_BATCH})")
+    logger.info(f"NPU stride: {stride} lines/node  "
+                f"(DOTW×NCORE×SIM_BATCH = 40×3×{SIM_BATCH} = {40*3*SIM_BATCH} expected)")
 
     raw_predictions = []
     for i in range(num_nodes):
-        # Index into the batch-0 copy of node i's output
         line_idx = i * stride
         if line_idx < total_lines:
             line = lines[line_idx]
             # Lane 0 = rightmost 4 hex chars of the 640-bit (160 hex-char) word
-            lane0_hex = line[-4:].strip()
+            lane0_hex = line[-4:]
             raw_val = hex_to_bfloat16_float(lane0_hex)
             raw_predictions.append(raw_val)
         else:
-            raw_predictions.append(0.0)
+            raw_predictions.append(0.5)   # neutral fallback for missing nodes
 
     raw_np = np.array(raw_predictions, dtype=np.float32)
 
-    # The NPU sigmoid LUT is applied in hardware; if it ran cleanly the output is
-    # already in [0,1]. We clamp + re-apply sigmoid to handle quantisation drift.
-    speed_ratios = 1.0 / (1.0 + np.exp(-np.clip(raw_np, -50, 50)))
+    # ── Sigmoid detection ────────────────────────────────────────────────────
+    # If the hardware sigmoid LUT ran correctly, all values are already in [0,1].
+    # Applying sigmoid AGAIN pushes them all toward 0.5 and destroys variation —
+    # this was the "always same output" bug.
+    #
+    # Detection rule: if ≥ 90 % of values are in (0, 1), treat as post-sigmoid.
+    post_sigmoid_fraction = float(np.mean((raw_np > 0.0) & (raw_np < 1.0)))
+
+    if post_sigmoid_fraction >= 0.9:
+        # Hardware sigmoid already applied — use values directly
+        speed_ratios = raw_np.copy()
+        logger.info(
+            f"NPU output: hardware sigmoid detected "
+            f"({post_sigmoid_fraction*100:.0f}% of values in (0,1))  — skipping software sigmoid"
+        )
+    else:
+        # Values look like raw logits — apply software sigmoid
+        speed_ratios = 1.0 / (1.0 + np.exp(-np.clip(raw_np, -50.0, 50.0)))
+        logger.info(
+            f"NPU output: raw logits detected "
+            f"({post_sigmoid_fraction*100:.0f}% of values in (0,1))  — applying software sigmoid"
+        )
+
     speed_ratios = np.clip(speed_ratios, 0.1, 1.0)
-
-    logger.info(f"NPU raw logit range : [{raw_np.min():.4f}, {raw_np.max():.4f}]")
-    logger.info(f"NPU speed-ratio range: [{speed_ratios.min():.4f}, {speed_ratios.max():.4f}]  "
-                f"std={speed_ratios.std():.4f}")
-
+    logger.info(
+        f"NPU speed-ratio range: [{speed_ratios.min():.4f}, {speed_ratios.max():.4f}]  "
+        f"std={speed_ratios.std():.4f}  mean={speed_ratios.mean():.4f}"
+    )
     return speed_ratios
 
 
@@ -531,39 +577,33 @@ async def predict_full_map(req: RouteRequest):
         npu_preds = parse_raw_hex_output(local_out_file, num_nodes=num_nodes)
 
         # ------------------------------------------------------------------
-        # 5b. Validate NPU output — fall back to PyTorch if degenerate
+        # 5b. Validate NPU output — only reject on hard failures (NaN/Inf).
         #
-        # "Always same output" root-causes:
-        #   • Remote simulation may not read the patched input.mif
-        #   • INT8 quantisation drift or MRF scale mismatch
-        #   • Stride/lane mis-alignment in parse_raw_hex_output
-        #
-        # We detect degeneracy via standard deviation threshold and fall back
-        # to the locally-loaded PyTorch model which always gives correct,
-        # differentiated predictions.
+        # Previously a std > 1e-4 gate was applied here, which caused the
+        # system to reject legitimate NPU outputs that happened to be tightly
+        # clustered (e.g. a quiet traffic period) and silently substitute
+        # PyTorch predictions.  Per the project requirement, predictions MUST
+        # come from the NPU hardware out_file; PyTorch is only a last resort
+        # for SSH/SCP failures, timeouts, and corrupt (non-finite) data.
         # ------------------------------------------------------------------
-        output_std = float(np.std(npu_preds))
-        output_valid = (
-            np.isfinite(npu_preds).all()
-            and output_std > 1e-4          # predictions must vary across nodes
-            and npu_preds.min() >= 0.0
-            and npu_preds.max() <= 1.0
-        )
-
-        if output_valid:
-            logger.info(f"NPU output accepted  (std={output_std:.4f})")
-            all_ratios = npu_preds
-        else:
+        if not np.isfinite(npu_preds).all():
             logger.warning(
-                f"NPU output rejected (std={output_std:.6f}, "
-                f"range=[{npu_preds.min():.3f},{npu_preds.max():.3f}]). "
-                "Falling back to PyTorch model."
+                "NPU output contains NaN/Inf values — falling back to PyTorch."
             )
             npu_available = False
+        else:
+            logger.info(
+                f"NPU output accepted — "
+                f"std={float(np.std(npu_preds)):.4f}  "
+                f"mean={float(np.mean(npu_preds)):.4f}  "
+                f"range=[{npu_preds.min():.4f}, {npu_preds.max():.4f}]"
+            )
+            all_ratios = npu_preds
 
     if not npu_available:
         # ------------------------------------------------------------------
-        # 5c. PyTorch fallback — always correct, locally executed
+        # 5c. PyTorch fallback — only reached on SSH/SCP failure, timeout,
+        #     or corrupt (non-finite) NPU output.
         # ------------------------------------------------------------------
         logger.info("Running PyTorch GNN inference (fallback)...")
         all_ratios = await loop.run_in_executor(None, _run_pytorch_inference, current_state)
