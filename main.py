@@ -38,13 +38,13 @@ def transfer_mif_to_remote(local_path="compiler/input.mif"):
     remote_dir = "~/Documents/npu_gnn_bringup/rtl/mif_files/"
     remote_target = f"{remote_user}@{remote_host}:{remote_dir}"
     
-    print(f"🚀 Transferring {local_path} to remote server...")
+    print(f"Transferring {local_path} to remote server...")
     try:
         # Use subprocess to execute the SCP command
         subprocess.run(["scp", local_path, remote_target], check=True)
-        print("✅ Transfer complete.")
+        print("Transfer complete.")
     except subprocess.CalledProcessError as e:
-        print(f"❌ SCP transfer failed: {e}")
+        print(f"SCP transfer failed: {e}")
 
 def hex_to_bfloat16_float(hex_str):
     """Converts a 4-character hex string (BFloat16) back to a standard Float32."""
@@ -88,16 +88,15 @@ def float_to_bf16_hex(f: float):
     """Converts a standard 32-bit float to a 16-bit BFloat16 Hex string."""
     u32 = struct.unpack('>I', struct.pack('>f', f))[0]
     return f"{u32 >> 16:04x}"
-
 def patch_npu_mif(current_state, edge_index, template_path="input_template.mif", output_path="input.mif"):
     """
-    Surgically overwrites the X Tensor in the hardware FIFO queue with real-time API data.
+    Surgically overwrites the X Tensor in the hardware FIFO queue by hunting 
+    for the exact hexadecimal signature of the dummy baseline data.
     """
     num_nodes = current_state.shape[0]
     num_edges = edge_index.shape[1]
     
     # 1. REPLICATE NPU HARDWARE SORTING
-    # The NPU scheduler sorts nodes by degree to optimize DSP utilization.
     adj_matrix = [[] for _ in range(num_nodes)]
     for i in range(num_edges):
         u, v = int(edge_index[0, i]), int(edge_index[1, i])
@@ -113,43 +112,38 @@ def patch_npu_mif(current_state, edge_index, template_path="input_template.mif",
             ordered_nodes.append(sorted_nodes[count]["id"])
             count += 1
             
-    # 2. CALCULATE HARDWARE MEMORY ADDRESS
-    # Offset = mfu0_add_ones(3) + mvu_zeros(1) + mvu_edges(num_edges) + mfu1_weights(num_edges)
-    start_addr = 4 + (2 * num_edges)
-    
-    # 3. FORMAT THE BFLOAT16 VECTOR LANES
+    # 2. FORMAT THE BFLOAT16 VECTOR LANES
     node_hex_map = {}
     for n_id in ordered_nodes:
-        features = current_state[n_id] # Your 7-channel Spatio-Temporal Data
-        
-        # Pad to the rigid 40-lane hardware width
+        features = current_state[n_id] 
         padded = np.zeros(40, dtype=np.float32)
         padded[:len(features)] = features
-        
-        # Pack the 640-bit word (Lane 39 at the MSB/Left, Lane 0 at the LSB/Right)
         hex_word = "".join([float_to_bf16_hex(padded[i]) for i in range(39, -1, -1)])
         node_hex_map[n_id] = hex_word
 
-    # 4. SURGICAL FILE OVERWRITE
+    # 3. SURGICAL SIGNATURE MATCHING
+    # The dummy feature payload is exactly 33 zeros followed by 7 ones (3f80)
+    dummy_signature = ("0000" * 33) + ("3f80" * 7)
+
     with open(template_path, "r") as f:
         lines = f.readlines()
         
     with open(output_path, "w") as f:
+        node_idx = 0
         for line in lines:
-            if ":" in line and line.strip().endswith(";"):
-                addr_str = line.split(":")[0].strip()
-                if addr_str.isdigit():
-                    addr = int(addr_str)
-                    
-                    # If the address is inside our X Tensor block, overwrite it
-                    if start_addr <= addr < start_addr + num_nodes:
-                        node_idx = ordered_nodes[addr - start_addr]
-                        hex_str = node_hex_map[node_idx]
-                        f.write(f"{addr}: {hex_str};\n")
-                        continue 
-            f.write(line)
+            # If we find the dummy payload, overwrite it with live API data
+            if dummy_signature in line and node_idx < num_nodes:
+                n_id = ordered_nodes[node_idx]
+                hex_str = node_hex_map[n_id]
+                
+                # Keep the line number prefix (e.g., "0: ")
+                addr_prefix = line.split(":")[0].strip()
+                f.write(f"{addr_prefix}: {hex_str};\n")
+                node_idx += 1
+            else:
+                f.write(line)
     
-    print(f"Patched NPU memory from addr {start_addr} to {start_addr + num_nodes - 1}.")
+    print(f" Successfully patched {node_idx} hardware memory addresses via signature matching.")
 
 # --- [Keep haversine_m, build_routing_graph exactly as before] ---
 def haversine_m(lat1, lon1, lat2, lon2):
@@ -193,24 +187,33 @@ def get_osm_path_data(G, path, weight_key):
 @app.on_event("startup")
 async def load_ai_assets():
     global model, edge_index, node_coords, kdtree, nx_graph, osm_graph
-    dataset = load_toronto_traffic_data()
-    edge_index = next(iter(dataset)).edge_index.to(device)
-
+    
+    print("🔧 Shrinking backend to match 21-Node NPU Hardware...")
+    
+    # 1. Load the exact 21-node topology from the NPU export
+    blob = np.load("toronto_npu_export.npz")
+    src = blob["edges_src"].astype(np.int64)
+    dst = blob["edges_dest"].astype(np.int64)
+    edge_index = torch.tensor([src, dst], dtype=torch.long).to(device)
+    
+    num_npu_nodes = int(max(src.max(), dst.max()) + 1)
+    
+    # 2. Get real Toronto coordinates, but ONLY take the first 21 
+    # to represent our toy hardware graph physically on the map.
     df = pd.read_csv("svc_raw_data_speed_2020_2024.csv")
     df = df[(df["latitude"] >= 43.643) & (df["latitude"] <= 43.658) & (df["longitude"] >= -79.395) & (df["longitude"] <= -79.370)]
     nodes_df = df.drop_duplicates(subset=["centreline_id"])[["centreline_id", "latitude", "longitude"]].sort_values("centreline_id").reset_index(drop=True)
-    node_coords = nodes_df[["latitude", "longitude"]].values
+    
+    node_coords = nodes_df[["latitude", "longitude"]].values[:num_npu_nodes]
     kdtree = KDTree(node_coords)
-
+    
+    # 3. Build the routing graph using ONLY these 21 nodes
     nx_graph = build_routing_graph(edge_index.cpu().numpy(), node_coords)
-    try:
-        import osmnx as ox
-        osm_graph = ox.graph_from_bbox(OSM_BBOX, network_type="drive", simplify=True)
-    except: osm_graph = None
-
-    model = TrafficPredictorGNN(node_features=7, hidden_dim=32)
-    model.load_state_dict(torch.load("traffic_gnn_weights.pth", map_location=device))
-    model.to(device).eval()
+    
+    # Disable full-scale OSM routing since we are restricted to a 21-node micro-graph
+    osm_graph = None 
+    
+    print(f"Micro-Graph Initialized: {num_npu_nodes} Nodes strictly bound to UI.")
 
 class TrafficPoint(BaseModel):
     lat: float; lng: float
@@ -220,6 +223,12 @@ class RouteRequest(BaseModel):
     start_pt: Optional[TrafficPoint] = None
     end_pt: Optional[TrafficPoint] = None
 
+@app.get("/valid_nodes")
+async def get_valid_nodes():
+    """Exposes the exact NPU hardware node coordinates to the frontend for UI snapping."""
+    if node_coords is None:
+        return {"nodes": []}
+    return {"nodes": [{"lat": float(c[0]), "lng": float(c[1])} for c in node_coords]}
 '''
 In-flight code
 @app.post("/predict_route")
@@ -381,7 +390,7 @@ async def predict_full_map(req: RouteRequest):
     npu_preds_numpy = parse_raw_hex_output(local_out_file, num_nodes=num_nodes)
 
     # Optional: If you haven't implemented Sigmoid in the C++ MFU yet, do it in Python here:
-    # npu_preds_numpy = 1 / (1 + np.exp(-npu_preds_numpy))
+    npu_preds_numpy = 1 / (1 + np.exp(-npu_preds_numpy))
 
     # Convert back to a PyTorch tensor so the routing logic works seamlessly
     pred_ratio = torch.tensor(npu_preds_numpy).to(device)
@@ -408,22 +417,44 @@ async def predict_full_map(req: RouteRequest):
     all_ratios = pred_ratio.squeeze().cpu().numpy()
     travel_data = {"standard_time_min": 0, "ai_time_min": 0, "std_route": [], "ai_route": []}
     '''
-    if req.start_pt and req.end_pt and osm_graph is not None:
-        import osmnx as ox
-        orig = int(ox.distance.nearest_nodes(osm_graph, req.start_pt.lng, req.start_pt.lat))
-        dest = int(ox.distance.nearest_nodes(osm_graph, req.end_pt.lng, req.end_pt.lat))
-        
-        apply_osm_ai_times(osm_graph, kdtree, all_ratios)
-        std_path = nx.shortest_path(osm_graph, orig, dest, weight="std_time_sec")
-        ai_path = nx.shortest_path(osm_graph, orig, dest, weight="ai_time_sec")
-        
-        travel_data["std_route"], _ = get_osm_path_data(osm_graph, std_path, "std_time_sec")
-        travel_data["ai_route"], ai_sec = get_osm_path_data(osm_graph, ai_path, "ai_time_sec")
-        _, std_sec_in_traffic = get_osm_path_data(osm_graph, std_path, "ai_time_sec")
-        
-        travel_data["standard_time_min"] = int(std_sec_in_traffic // 60)
-        travel_data["ai_time_min"] = int(ai_sec // 60)
+    # --- ROUTE USING THE 21-NODE HARDWARE GRAPH ---
+    if req.start_pt and req.end_pt:
+        # 1. Snap the user's map clicks to the nearest 21-node ID
+        _, orig = kdtree.query([req.start_pt.lat, req.start_pt.lng])
+        _, dest = kdtree.query([req.end_pt.lat, req.end_pt.lng])
+        orig, dest = int(orig), int(dest)
 
+        # 2. Apply the Silicon NPU predictions to the network edges
+        for u, v, data in nx_graph.edges(data=True):
+            dist = data['distance']
+            data['std_time_sec'] = dist / BASE_SPEED_MS
+            
+            # Average the AI congestion ratio of the two connecting nodes
+            edge_ratio = max(0.1, float((all_ratios[u] + all_ratios[v]) / 2.0))
+            data['ai_time_sec'] = dist / (BASE_SPEED_MS * edge_ratio)
+
+        # 3. Calculate Shortest Paths through the 21-node toy graph
+        try:
+            std_path = nx.shortest_path(nx_graph, orig, dest, weight="std_time_sec")
+            ai_path = nx.shortest_path(nx_graph, orig, dest, weight="ai_time_sec")
+
+            # 4. Extract Total Times and Coordinate Arrays for the Frontend map
+            std_time_sec = sum(nx_graph[u][v]['std_time_sec'] for u, v in zip(std_path[:-1], std_path[1:]))
+            ai_time_sec = sum(nx_graph[u][v]['ai_time_sec'] for u, v in zip(ai_path[:-1], ai_path[1:]))
+            
+            # Convert seconds to minutes (minimum 1 minute to avoid showing 0)
+            travel_data["standard_time_min"] = max(1, int(std_time_sec // 60))
+            travel_data["ai_time_min"] = max(1, int(ai_time_sec // 60))
+            
+            travel_data["std_route"] = [{"lat": float(node_coords[node][0]), "lng": float(node_coords[node][1])} for node in std_path]
+            travel_data["ai_route"] = [{"lat": float(node_coords[node][0]), "lng": float(node_coords[node][1])} for node in ai_path]
+            
+        except nx.NetworkXNoPath:
+            print("No valid path found between these nodes in the toy graph.")
+
+    # Invert the ratio for Deck.gl (0.1 ratio = 0.9 Congestion Heat)
+    results = [{"lat": float(node_coords[i][0]), "lng": float(node_coords[i][1]), "congestion": 1.0 - float(all_ratios[i])} for i in range(num_nodes)]
+    return {"predictions": results, "travel": travel_data, "status": "success"}
     # Invert the ratio for Deck.gl (0.1 ratio = 0.9 Congestion Heat)
     results = [{"lat": float(node_coords[i][0]), "lng": float(node_coords[i][1]), "congestion": 1.0 - float(all_ratios[i])} for i in range(num_nodes)]
     return {"predictions": results, "travel": travel_data, "status": "success"}

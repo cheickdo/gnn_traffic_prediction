@@ -43,7 +43,7 @@
         
         #tooltip { position: absolute; z-index: 999; pointer-events: none; display: none; background: rgba(15, 20, 35, 0.95); padding: 8px 12px; border: 1px solid #475569; border-radius: 6px; color: #fff; font-size: 12px; font-family: monospace; box-shadow: 0 4px 15px rgba(0,0,0,0.5); backdrop-filter: blur(4px); transform: translate(-50%, -120%); white-space: nowrap;}
         
-        .legend-dot { display: inline-block; width: 10px; height: 10px; background: rgba(0, 210, 255, 0.2); border: 1px solid #00d2ff; margin-right: 5px; vertical-align: middle; }
+        .legend-dot { display: inline-block; width: 10px; height: 10px; margin-right: 5px; vertical-align: middle; border-width: 1px; border-style: solid;}
     </style>
 </head>
 <body>
@@ -54,8 +54,9 @@
         <h2>AI ETA Engine</h2>
         <p>
             NPU spatial matrix prediction for real-time dynamic pathfinding.<br>
-            <span style="font-size: 11px; color: #94a3b8; display: block; margin-top: 8px;">
-                <span class="legend-dot"></span>Valid AI Training Zone
+            <span style="font-size: 11px; color: #94a3b8; display: block; margin-top: 8px; line-height: 2;">
+                <span class="legend-dot" style="background: rgba(0, 210, 255, 0.2); border-color: #00d2ff;"></span>Valid AI Training Zone (Core)<br>
+                <span class="legend-dot" style="background: rgba(148, 163, 184, 0.5); border-color: #94a3b8; border-radius: 50%;"></span>Hardware Node
             </span>
         </p>
         
@@ -91,16 +92,20 @@
         let aiRouteData = [];
         let stdRouteData = [];
 
+        // Hardware Node State
+        let hardwareNodes = [];
+        let hardwareNodesLayerData = [];
+
         const tooltip = document.getElementById('tooltip');
 
-        // FIXED: The polygon ring is now explicitly closed to prevent WebGL validation errors
+        // Original 1x Trained Blue Box (Dense Downtown Core)
         const boundingBoxData = [{
             polygon: [
                 [-79.395, 43.643], 
                 [-79.395, 43.658], 
                 [-79.370, 43.658], 
                 [-79.370, 43.643],
-                [-79.395, 43.643] // Explicit closing coordinate
+                [-79.395, 43.643] 
             ]
         }];
 
@@ -123,13 +128,44 @@
             controller: true,
             onClick: (info) => handleMapClick(info.coordinate),
             onHover: (info) => handleHover(info),
-            // FIXED: Native DeckGL lifecycle hook instead of invalid .on() event listener
             onLoad: () => triggerRender() 
         });
 
-        let isShiftDown = false;
-        window.addEventListener('keydown', e => { if (e.key === 'Shift') isShiftDown = true; });
-        window.addEventListener('keyup', e => { if (e.key === 'Shift') isShiftDown = false; });
+        // FETCH AND SNAP LOGIC
+        async function fetchHardwareNodes() {
+            try {
+                const response = await fetch('http://localhost:8000/valid_nodes');
+                const data = await response.json();
+                hardwareNodes = data.nodes;
+                
+                // Create faint grey dots to show the user exactly where the network exists
+                hardwareNodesLayerData = hardwareNodes.map(n => ({
+                    position: [n.lng, n.lat],
+                    color: [148, 163, 184, 80] // Slate grey, semi-transparent
+                }));
+                triggerRender();
+            } catch (error) {
+                console.error("Failed to load hardware nodes:", error);
+            }
+        }
+        fetchHardwareNodes();
+
+        function snapToNearestNode(lng, lat) {
+            if (hardwareNodes.length === 0) return [lng, lat];
+            
+            let nearest = null;
+            let minDist = Infinity;
+            
+            // Standard Euclidean distance calculation to find the closest valid pin
+            for (const node of hardwareNodes) {
+                const dist = Math.pow(node.lng - lng, 2) + Math.pow(node.lat - lat, 2);
+                if (dist < minDist) {
+                    minDist = dist;
+                    nearest = [node.lng, node.lat];
+                }
+            }
+            return nearest;
+        }
 
         function setMode(mode) {
             currentMode = mode;
@@ -147,11 +183,13 @@
                 tooltip.style.display = 'none';
             }
 
-            if (isShiftDown && currentMode === 'jam' && info.coordinate) {
-                const [lng, lat] = info.coordinate;
+            if (info.srcEvent && info.srcEvent.shiftKey && currentMode === 'jam' && info.coordinate) {
+                // SNAP HOVER DRAWING
+                const [lng, lat] = snapToNearestNode(info.coordinate[0], info.coordinate[1]);
                 const lastMarker = inputMarkers[inputMarkers.length - 1];
                 
-                if (!lastMarker || Math.abs(lastMarker.position[0] - lng) > 0.0005 || Math.abs(lastMarker.position[1] - lat) > 0.0005) {
+                // Only push a new marker if we snapped to a DIFFERENT node than the last one
+                if (!lastMarker || lastMarker.position[0] !== lng || lastMarker.position[1] !== lat) {
                     inputMarkers.push({ position: [lng, lat], color: [255, 50, 50] });
                     triggerRender();
                 }
@@ -160,7 +198,9 @@
 
         function handleMapClick(coords) {
             if (!coords) return;
-            const [lng, lat] = coords;
+            // SNAP CLICK INPUTS
+            const [lng, lat] = snapToNearestNode(coords[0], coords[1]);
+            
             if (currentMode === 'jam') inputMarkers.push({ position: [lng, lat], color: [255, 50, 50] });
             else if (currentMode === 'start') startMarker = { position: [lng, lat], color: [16, 185, 129] };
             else if (currentMode === 'end') endMarker = { position: [lng, lat], color: [139, 92, 246] };
@@ -183,6 +223,7 @@
 
             deckgl.setProps({
                 layers: [
+                    // Original 1x Trained Blue Box
                     new PolygonLayer({
                         id: 'bounding-box',
                         data: boundingBoxData,
@@ -194,6 +235,16 @@
                         getLineColor: [0, 210, 255, 150], 
                         getLineWidth: 2,
                         lineWidthUnits: 'pixels'
+                    }),
+                    // Hardware Node Visualizer Layer
+                    new ScatterplotLayer({
+                        id: 'hardware-base-nodes', 
+                        data: hardwareNodesLayerData, 
+                        getPosition: d => d.position, 
+                        getFillColor: d => d.color, 
+                        getRadius: 25, 
+                        radiusMinPixels: 4,
+                        pickable: false
                     }),
                     new HeatmapLayer({
                         id: 'congestion-heat',
@@ -261,7 +312,6 @@
                     
                     heatmapData = data.predictions || [];
                     
-                    // FIXED: Optional chaining to prevent deep access crashes if paths fail to generate
                     if (data.travel?.std_route?.length > 0) stdRouteData = [{ path: data.travel.std_route.map(p => [p.lng, p.lat]) }];
                     if (data.travel?.ai_route?.length > 0) aiRouteData = [{ path: data.travel.ai_route.map(p => [p.lng, p.lat, 50]) }];
 
