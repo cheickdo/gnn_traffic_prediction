@@ -1,15 +1,29 @@
+"""
+main.py — FastAPI backend for the Toronto NPU Traffic Prediction System.
+
+End-to-end pipeline:
+  1. Build 7-channel node feature tensor from user-drawn congestion
+  2. Hot-patch NPU hardware input MIF with BFloat16 features
+  3. Transfer MIF to remote Stratix 10 NX FPGA via SCP
+  4. Poll for RTL simulation completion (sim_done sentinel)
+  5. Fetch and decode hardware output (640-bit BFloat16 words)
+  6. Apply predictions to OSM road network for route planning
+  7. Return heatmap, routes, and pipeline telemetry to frontend
+"""
+
 import asyncio
 import os
 import struct
 import subprocess
+import time
 import logging
 from datetime import datetime
 from pathlib import Path
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 import torch
 import numpy as np
 from scipy.spatial import KDTree
@@ -19,91 +33,127 @@ import networkx as nx
 from model import TrafficPredictorGNN
 from data_loader import load_toronto_traffic_data
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
 logger = logging.getLogger(__name__)
 
-app = FastAPI()
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app = FastAPI(title="NPU Traffic Prediction Engine", version="2.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-model, edge_index, node_coords, kdtree, nx_graph, osm_graph = None, None, None, None, None, None
+
+def _error_response(detail: str, status_code: int = 200) -> JSONResponse:
+    """Build a JSON error response with explicit CORS headers."""
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "status": "error",
+            "detail": detail,
+            "predictions": [],
+            "travel": {
+                "standard_time_min": 0,
+                "ai_time_min": 0,
+                "std_route": [],
+                "ai_route": [],
+            },
+        },
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Credentials": "true",
+        },
+    )
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Catch ALL unhandled exceptions and return JSON instead of 500 HTML."""
+    logger.exception(f"Unhandled exception on {request.url.path}: {exc}")
+    return _error_response(str(exc))
+
+
+from fastapi.exceptions import RequestValidationError
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Return 200 JSON for pydantic validation errors so the frontend can parse them."""
+    detail = "; ".join(
+        f"{'.'.join(str(x) for x in e['loc'])}: {e['msg']}" for e in exc.errors()
+    )
+    logger.warning(f"Validation error on {request.url.path}: {detail}")
+    return _error_response(f"Invalid request: {detail}")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Global state
+# ──────────────────────────────────────────────────────────────────────────────
+model, edge_index, node_coords, kdtree, nx_graph, osm_graph = (
+    None, None, None, None, None, None,
+)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 DEFAULT_SPEED_KMH = 40.0
 BASE_SPEED_MS = DEFAULT_SPEED_KMH * 1000.0 / 3600.0
 OSM_BBOX = (-79.395, 43.643, -79.370, 43.658)
 
-# Hardware constants matching toronto_npu_model.py
+# NPU hardware constants (Intel Stratix 10 NX)
 SIM_BATCH = 3
+DOTW = 40      # 40 vector lanes × 16-bit BFloat16 = 640-bit words
+NCORE = 3      # 3 DSP cores
+NPU_WORD_BITS = 640
 
 REMOTE_USER = "doumbiac"
 REMOTE_HOST = "betzgrp-wintermute.eecg.utoronto.ca"
 REMOTE_BASE = "~/Documents/npu_gnn_bringup/rtl"
 
 
-def transfer_mif_to_remote(local_path="input.mif"):
-    remote_target = f"{REMOTE_USER}@{REMOTE_HOST}:{REMOTE_BASE}/mif_files/"
-    logger.info(f"Transferring {local_path} to remote server...")
-    try:
-        subprocess.run(["scp", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
-                        local_path, remote_target], check=True, timeout=30)
-        logger.info("Transfer complete.")
-    except subprocess.CalledProcessError as e:
-        logger.error(f"SCP transfer failed: {e}")
-        raise
-    except subprocess.TimeoutExpired:
-        logger.error("SCP transfer timed out after 30s")
-        raise
+# ──────────────────────────────────────────────────────────────────────────────
+# BFloat16 Conversion Utilities
+# ──────────────────────────────────────────────────────────────────────────────
+
+def float_to_bf16_hex(f: float) -> str:
+    """Convert IEEE-754 float32 to 4-char BFloat16 hex (top 16 bits)."""
+    u32 = struct.unpack(">I", struct.pack(">f", f))[0]
+    return f"{u32 >> 16:04x}"
 
 
-def hex_to_bfloat16_float(hex_str):
-    """Converts a 4-character hex string (BFloat16) back to a standard Float32."""
+def hex_to_bfloat16_float(hex_str: str) -> float:
+    """Convert 4-char BFloat16 hex back to float32."""
     try:
         padded_hex = hex_str.strip().zfill(4) + "0000"
-        val = struct.unpack('>f', struct.pack('>I', int(padded_hex, 16)))[0]
-        # Guard against NaN/Inf from malformed hardware output
-        if not np.isfinite(val):
-            return 0.0
-        return val
+        val = struct.unpack(">f", struct.pack(">I", int(padded_hex, 16)))[0]
+        return val if np.isfinite(val) else 0.0
     except Exception:
         return 0.0
 
 
-def parse_raw_hex_output(filepath, num_nodes):
-    """Parse out_file produced by npu_tb.sv and return per-node speed ratios.
+# ──────────────────────────────────────────────────────────────────────────────
+# NPU Hardware Output Parser
+# ──────────────────────────────────────────────────────────────────────────────
 
-    ── Testbench output format (npu_tb.sv) ─────────────────────────────────────
-    The write statement is:
-        $fwrite(out_file, "%h \\n", output_rd_data[0]);
-    It sits inside BOTH a lane-check loop (i = 0..DOTW-1) AND a core loop
-    (j = 0..NCORE-1).  Therefore every hardware output word is written
-    DOTW × NCORE = 40 × 3 = 120 times as consecutive, identical lines.
+def parse_raw_hex_output(filepath: str, num_nodes: int) -> np.ndarray:
+    """Parse out_file produced by npu_tb.sv → per-node speed ratios.
 
-    ── Bit layout of each 640-bit output word ──────────────────────────────────
-    SystemVerilog %h prints MSB-first:
-        chars  0– 3  →  bits [639:624]  =  lane 39  (most-significant)
-        chars  4– 7  →  bits [623:608]  =  lane 38
-        ...
-        chars 156–159 →  bits [15:0]    =  lane  0  (least-significant)
+    ── Testbench output format ─────────────────────────────────────────
+    The $fwrite sits inside both a lane loop (i=0..DOTW-1) and a core
+    loop (j=0..NCORE-1), so every 640-bit output word is repeated
+    DOTW × NCORE = 120 times as consecutive identical lines.
 
-    Lane 0 holds output dimension 0 from the prediction head.
-    w_head_q is padded so only row 0 is non-zero, meaning lane 0 contains the
-    real per-node prediction; lanes 1-31 hold sigmoid(0)=0.5 (garbage rows).
+    ── 640-bit word layout (MSB-first hex) ─────────────────────────────
+    chars 0-3   = lane 39 (MSB)    chars 156-159 = lane 0 (LSB)
+    Lane 0 holds the real prediction (output dim 0 from the padded head).
 
-    ── Sigmoid handling ────────────────────────────────────────────────────────
-    The RTL MFU runs the sigmoid LUT in hardware (it is physically present on
-    the FPGA).  Therefore out_file values are ALREADY in (0, 1).
-    Applying Python sigmoid on top compresses all predictions toward 0.5,
-    which is why the output previously appeared "always the same".
-    Fix: detect whether values are post-sigmoid and skip the software pass.
-
-    ── Stride calculation ──────────────────────────────────────────────────────
-    total_lines  = num_output_words × DOTW × NCORE
-    num_output_words = num_nodes × SIM_BATCH  (one write_back per node, batch=3)
-    →  total_lines  = num_nodes × 3 × 40 × 3 = num_nodes × 360
-    →  stride       = total_lines // num_nodes = 360
-
-    For each node i, line i × stride is batch-0's first write → lane 0 is the
-    actual prediction.
+    ── Sigmoid ─────────────────────────────────────────────────────────
+    The RTL MFU applies sigmoid via hardware LUT → values in out_file
+    are already in (0,1).  Applying sigmoid again compresses everything
+    to ~0.5 ("always same output" bug).
     """
     fallback = np.ones(num_nodes, dtype=np.float32) * 0.5
 
@@ -112,9 +162,9 @@ def parse_raw_hex_output(filepath, num_nodes):
         return fallback
 
     with open(filepath, "r") as f:
-        # Keep only lines that look like hex words (≥4 chars, no 'x' unknowns)
         lines = [
-            l.strip() for l in f
+            l.strip()
+            for l in f
             if l.strip() and len(l.strip()) >= 4 and "x" not in l.lower()
         ]
 
@@ -125,101 +175,93 @@ def parse_raw_hex_output(filepath, num_nodes):
         logger.error("NPU out_file is empty or contains only unknown (x) bits.")
         return fallback
 
-    # Each hardware output word appears stride = total_lines // num_nodes times.
-    # Reading line[i * stride] gives the first occurrence of node i's output word.
     stride = max(1, total_lines // num_nodes)
-    logger.info(f"NPU stride: {stride} lines/node  "
-                f"(DOTW×NCORE×SIM_BATCH = 40×3×{SIM_BATCH} = {40*3*SIM_BATCH} expected)")
+    logger.info(
+        f"NPU stride: {stride} lines/node  "
+        f"(expected DOTW×NCORE = {DOTW}×{NCORE} = {DOTW * NCORE})"
+    )
 
-    raw_predictions = []
+    raw_predictions: list = []
+    raw_hex_samples: list = []
+
     for i in range(num_nodes):
         line_idx = i * stride
         if line_idx < total_lines:
             line = lines[line_idx]
-            # Lane 0 = rightmost 4 hex chars of the 640-bit (160 hex-char) word
             lane0_hex = line[-4:]
             raw_val = hex_to_bfloat16_float(lane0_hex)
             raw_predictions.append(raw_val)
+            if i < 5:
+                raw_hex_samples.append(f"node{i}: 0x{lane0_hex} = {raw_val:.6f}")
         else:
-            raw_predictions.append(0.5)   # neutral fallback for missing nodes
+            raw_predictions.append(0.5)
 
     raw_np = np.array(raw_predictions, dtype=np.float32)
 
-    # ── Sigmoid detection ────────────────────────────────────────────────────
-    # If the hardware sigmoid LUT ran correctly, all values are already in [0,1].
-    # Applying sigmoid AGAIN pushes them all toward 0.5 and destroys variation —
-    # this was the "always same output" bug.
-    #
-    # Detection rule: if ≥ 90 % of values are in (0, 1), treat as post-sigmoid.
-    post_sigmoid_fraction = float(np.mean((raw_np > 0.0) & (raw_np < 1.0)))
+    # Log sample decoded values for debugging
+    for s in raw_hex_samples:
+        logger.info(f"  BF16 sample: {s}")
 
-    if post_sigmoid_fraction >= 0.9:
-        # Hardware sigmoid already applied — use values directly
+    # ── Sigmoid detection ─────────────────────────────────────────────
+    post_sigmoid_frac = float(np.mean((raw_np > 0.0) & (raw_np < 1.0)))
+
+    if post_sigmoid_frac >= 0.9:
         speed_ratios = raw_np.copy()
         logger.info(
-            f"NPU output: hardware sigmoid detected "
-            f"({post_sigmoid_fraction*100:.0f}% of values in (0,1))  — skipping software sigmoid"
+            f"NPU: hardware sigmoid detected ({post_sigmoid_frac*100:.0f}% in (0,1)) "
+            "— using values directly"
         )
     else:
-        # Values look like raw logits — apply software sigmoid
         speed_ratios = 1.0 / (1.0 + np.exp(-np.clip(raw_np, -50.0, 50.0)))
         logger.info(
-            f"NPU output: raw logits detected "
-            f"({post_sigmoid_fraction*100:.0f}% of values in (0,1))  — applying software sigmoid"
+            f"NPU: raw logits detected ({post_sigmoid_frac*100:.0f}% in (0,1)) "
+            "— applying software sigmoid"
         )
 
     speed_ratios = np.clip(speed_ratios, 0.1, 1.0)
     logger.info(
-        f"NPU speed-ratio range: [{speed_ratios.min():.4f}, {speed_ratios.max():.4f}]  "
+        f"NPU speed-ratio: [{speed_ratios.min():.4f}, {speed_ratios.max():.4f}]  "
         f"std={speed_ratios.std():.4f}  mean={speed_ratios.mean():.4f}"
     )
     return speed_ratios
 
 
-def float_to_bf16_hex(f: float):
-    """Converts a standard 32-bit float to a 16-bit BFloat16 Hex string."""
-    u32 = struct.unpack('>I', struct.pack('>f', f))[0]
-    return f"{u32 >> 16:04x}"
+# ──────────────────────────────────────────────────────────────────────────────
+# MIF Patching — Hot-swap node features in hardware input FIFO
+# ──────────────────────────────────────────────────────────────────────────────
 
+def patch_npu_mif(
+    current_state: np.ndarray,
+    edge_index_np: np.ndarray,
+    template_path: str = "input_template.mif",
+    output_path: str = "input.mif",
+) -> int:
+    """Overwrite X tensor (node features) in hardware MIF.
 
-def patch_npu_mif(current_state, edge_index, template_path="input_template.mif", output_path="input.mif"):
-    """
-    Surgically overwrites the X Tensor (node features) in the hardware input FIFO.
-
-    The MIF file layout matches the load order in toronto_npu_model.py:
-      Address 0 .. (num_nodes * SIM_BATCH - 1):  mfu0_mul_nodes (node features)
-      Then: mvu_edges, mfu1_mul_edge_weights, mfu0_add_ones, mfu1_mul_ones
-
-    Each npu.load() with batch=SIM_BATCH writes SIM_BATCH consecutive entries.
-    Nodes are loaded in natural order (0, 1, 2, ..., N-1), NOT sorted by degree.
+    MIF layout mirrors the load order in toronto_npu_model.py:
+      Address 0..(num_nodes×SIM_BATCH-1): mfu0_mul_nodes (node features)
+    Each node has SIM_BATCH=3 consecutive entries.
+    Returns the number of patched entries.
     """
     num_nodes = current_state.shape[0]
-    num_features = current_state.shape[1]
-
-    # X tensor starts at address 0 (mfu0_mul_nodes is loaded FIRST in the driver)
     start_addr = 0
-    entries_per_node = SIM_BATCH  # Each node has 3 consecutive MIF entries
+    entries_per_node = SIM_BATCH
 
-    # Format each node's features as a 640-bit BFloat16 hex word
-    node_hex_words = {}
+    # Format each node's features as 640-bit BFloat16 hex
+    node_hex_words: dict = {}
     for n_id in range(num_nodes):
         features = current_state[n_id]
-
-        # Pad to the rigid 40-lane hardware width
-        padded = np.zeros(40, dtype=np.float32)
-        padded[:len(features)] = features
-
-        # Pack: Lane 39 (MSB/Left) to Lane 0 (LSB/Right)
-        hex_word = "".join([float_to_bf16_hex(padded[i]) for i in range(39, -1, -1)])
+        padded = np.zeros(DOTW, dtype=np.float32)
+        padded[: len(features)] = features
+        # Pack: lane 39 (MSB/left) → lane 0 (LSB/right)
+        hex_word = "".join(float_to_bf16_hex(padded[i]) for i in range(DOTW - 1, -1, -1))
         node_hex_words[n_id] = hex_word
 
-    # Read template
     with open(template_path, "r") as f:
         lines = f.readlines()
 
-    # Overwrite the X tensor addresses
-    end_addr = start_addr + (num_nodes * entries_per_node)
-    patched_count = 0
+    end_addr = start_addr + num_nodes * entries_per_node
+    patched = 0
 
     with open(output_path, "w") as f:
         for line in lines:
@@ -227,57 +269,101 @@ def patch_npu_mif(current_state, edge_index, template_path="input_template.mif",
                 addr_str = line.split(":")[0].strip()
                 if addr_str.isdigit():
                     addr = int(addr_str)
-
                     if start_addr <= addr < end_addr:
-                        # Map address to node index: addr // SIM_BATCH = node index
                         node_idx = (addr - start_addr) // entries_per_node
                         if node_idx < num_nodes:
-                            hex_str = node_hex_words[node_idx]
-                            f.write(f"{addr}: {hex_str};\n")
-                            patched_count += 1
+                            f.write(f"{addr}: {node_hex_words[node_idx]};\n")
+                            patched += 1
                             continue
             f.write(line)
 
-    logger.info(f"Patched {patched_count} MIF entries (addresses {start_addr} to {end_addr - 1}) for {num_nodes} nodes")
+    logger.info(
+        f"MIF patched: {patched} entries (addr {start_addr}–{end_addr - 1}) "
+        f"for {num_nodes} nodes"
+    )
+    return patched
 
-# --- [Keep haversine_m, build_routing_graph exactly as before] ---
-def haversine_m(lat1, lon1, lat2, lon2):
-    r = 6371000.0
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Remote NPU Transfer
+# ──────────────────────────────────────────────────────────────────────────────
+
+def transfer_mif_to_remote(local_path: str = "input.mif") -> float:
+    """SCP the patched MIF to the remote FPGA server.
+
+    Also deletes stale sim_done and out_file on the remote FIRST so the
+    testbench knows to start a fresh simulation.  Returns elapsed seconds.
+    """
+    remote_host = f"{REMOTE_USER}@{REMOTE_HOST}"
+    remote_target = f"{remote_host}:{REMOTE_BASE}/mif_files/"
+    t0 = time.perf_counter()
+
+    # 1. Delete stale sentinel & output on the remote
+    subprocess.run(
+        [
+            "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+            remote_host,
+            f"rm -f {REMOTE_BASE}/sim_done {REMOTE_BASE}/out_file",
+        ],
+        timeout=15,
+    )
+
+    # 2. Upload the new MIF
+    subprocess.run(
+        [
+            "scp", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+            local_path, remote_target,
+        ],
+        check=True,
+        timeout=30,
+    )
+    elapsed = time.perf_counter() - t0
+    logger.info(f"SCP transfer complete ({elapsed:.2f}s)")
+    return elapsed
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Geometry & Routing Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def haversine_m(lat1, lon1, lat2, lon2) -> float:
+    r = 6_371_000.0
     p1, p2 = np.radians(lat1), np.radians(lat2)
-    a = np.sin(np.radians(lat2 - lat1) / 2) ** 2 + np.cos(p1) * np.cos(p2) * np.sin(np.radians(lon2 - lon1) / 2) ** 2
+    a = (
+        np.sin(np.radians(lat2 - lat1) / 2) ** 2
+        + np.cos(p1) * np.cos(p2) * np.sin(np.radians(lon2 - lon1) / 2) ** 2
+    )
     return float(2 * r * np.arcsin(np.sqrt(np.clip(a, 0.0, 1.0))))
+
 
 def build_routing_graph(edges, coords):
     g = nx.Graph()
-    for i in range(len(coords)): g.add_node(i)
+    for i in range(len(coords)):
+        g.add_node(i)
     for k in range(edges.shape[1]):
         u, v = int(edges[0, k]), int(edges[1, k])
-        if u != v: g.add_edge(u, v, distance=haversine_m(coords[u][0], coords[u][1], coords[v][0], coords[v][1]))
+        if u != v:
+            g.add_edge(
+                u, v,
+                distance=haversine_m(
+                    coords[u][0], coords[u][1], coords[v][0], coords[v][1]
+                ),
+            )
     return g
 
-def _osmnx_nearest_nodes(G, x: float, y: float) -> int:
-    """Version-agnostic wrapper around osmnx nearest_nodes.
 
-    osmnx 1.x: ox.distance.nearest_nodes(G, X, Y)
-    osmnx 2.x: ox.nearest_nodes(G, X, Y)
-    """
+def _osmnx_nearest_nodes(G, x: float, y: float) -> int:
+    """Version-agnostic wrapper (osmnx 1.x vs 2.x)."""
     import osmnx as ox
+
     fn = getattr(ox, "nearest_nodes", None) or ox.distance.nearest_nodes
     return int(fn(G, x, y))
 
 
-def apply_osm_ai_times(G: nx.MultiDiGraph, tmc_kdtree: KDTree, speed_ratios: np.ndarray):
-    """Stamp std_time_sec and ai_time_sec onto every OSM edge.
-
-    Uses the osmnx 'travel_time' attribute (added by add_edge_travel_times) as the
-    free-flow baseline when available.  Falls back to length / BASE_SPEED_MS otherwise.
-    The ai_time_sec is the free-flow time scaled up by the inverse of the predicted
-    speed ratio (ratio=0.1 → 10× slower than free-flow).
-
-    BUG FIX: The previous fallback was 1.0 m which produced ~0.09 s/edge and
-    therefore 0-minute route estimates.  Real OSM edges are tens to hundreds of
-    metres; 50 m is a safe minimum fallback.
-    """
+def apply_osm_ai_times(
+    G: nx.MultiDiGraph, tmc_kdtree: KDTree, speed_ratios: np.ndarray
+):
+    """Stamp std_time_sec and ai_time_sec on every OSM edge."""
     for u, v, k, d in G.edges(keys=True, data=True):
         lat = 0.5 * (float(G.nodes[u]["y"]) + float(G.nodes[v]["y"]))
         lng = 0.5 * (float(G.nodes[u]["x"]) + float(G.nodes[v]["x"]))
@@ -285,221 +371,213 @@ def apply_osm_ai_times(G: nx.MultiDiGraph, tmc_kdtree: KDTree, speed_ratios: np.
 
         ratio = max(0.1, float(speed_ratios[int(ti)]))
 
-        # Prefer osmnx's pre-computed travel_time (based on OSM speed tags);
-        # fall back to length / 40 km/h.  Never let the fallback be < 1 second.
         free_flow_sec = float(d.get("travel_time", 0.0))
         if free_flow_sec <= 0:
-            length_m = float(d.get("length", 50.0))   # 50 m safe fallback
+            length_m = float(d.get("length", 50.0))
             free_flow_sec = max(1.0, length_m / BASE_SPEED_MS)
 
         d["std_time_sec"] = free_flow_sec
-        # Congested time: slower speed = proportionally longer travel time
-        d["ai_time_sec"]  = free_flow_sec / ratio
+        d["ai_time_sec"] = free_flow_sec / ratio
+
 
 def get_osm_path_data(G, path, weight_key):
-    """Extract lat/lng coordinate list and total travel time for an OSM node-id path.
-
-    Uses stored LineString geometry where available (follows actual road curves).
-    Falls back to straight node-to-node segments for simplified edges that have no
-    geometry attribute.  Duplicate junction points between consecutive edges are
-    deduplicated so PathLayer renders a clean, continuous polyline.
-    """
+    """Extract coordinates and total time for an OSM node-id path."""
     coords: list = []
-    total_time: float = 0.0
+    total_time = 0.0
 
     for u, v in zip(path[:-1], path[1:]):
         edge_data = G[u][v]
-        k = min(edge_data.keys(), key=lambda kk: float(edge_data[kk].get(weight_key, 1e30)))
+        k = min(
+            edge_data.keys(),
+            key=lambda kk: float(edge_data[kk].get(weight_key, 1e30)),
+        )
         total_time += float(edge_data[k].get(weight_key, 0.0))
 
         geom = edge_data[k].get("geometry")
         if geom:
-            edge_pts = [{"lat": float(lat), "lng": float(lon)} for lon, lat in geom.coords]
+            edge_pts = [
+                {"lat": float(lat), "lng": float(lon)} for lon, lat in geom.coords
+            ]
         else:
             edge_pts = [
                 {"lat": float(G.nodes[u]["y"]), "lng": float(G.nodes[u]["x"])},
-                {"lat": float(G.nodes[v]["y"]), "lng": float(G.nodes[v]["x"])}
+                {"lat": float(G.nodes[v]["y"]), "lng": float(G.nodes[v]["x"])},
             ]
 
         if not edge_pts:
             continue
 
-        # Drop the first point of each edge if it duplicates the last accumulated point
-        # (the shared junction node between two consecutive edges).
+        # Deduplicate shared junction nodes between consecutive edges
         if coords:
             first = edge_pts[0]
-            last  = coords[-1]
-            if abs(first["lat"] - last["lat"]) < 1e-9 and abs(first["lng"] - last["lng"]) < 1e-9:
+            last = coords[-1]
+            if (
+                abs(first["lat"] - last["lat"]) < 1e-9
+                and abs(first["lng"] - last["lng"]) < 1e-9
+            ):
                 edge_pts = edge_pts[1:]
 
         coords.extend(edge_pts)
 
     return coords, total_time
 
-@app.on_event("startup")
-async def load_ai_assets():
-    global model, edge_index, node_coords, kdtree, nx_graph, osm_graph
-    dataset = load_toronto_traffic_data()
-    edge_index = next(iter(dataset)).edge_index.to(device)
 
-    df = pd.read_csv("svc_raw_data_speed_2020_2024.csv")
-    df = df[(df["latitude"] >= 43.643) & (df["latitude"] <= 43.658) & (df["longitude"] >= -79.395) & (df["longitude"] <= -79.370)]
-    nodes_df = df.drop_duplicates(subset=["centreline_id"])[["centreline_id", "latitude", "longitude"]].sort_values("centreline_id").reset_index(drop=True)
-    node_coords = nodes_df[["latitude", "longitude"]].values
-    kdtree = KDTree(node_coords)
-
-    nx_graph = build_routing_graph(edge_index.cpu().numpy(), node_coords)
-    try:
-        import osmnx as ox
-        from shapely.geometry import box as shapely_box
-
-        # Use graph_from_polygon with a shapely box — this API is stable across
-        # all osmnx versions and avoids the (north,south,east,west) vs
-        # (west,south,east,north) argument-order confusion that broke 1.x/2.x compat.
-        bbox_polygon = shapely_box(-79.395, 43.643, -79.370, 43.658)
-        osm_graph = ox.graph_from_polygon(
-            bbox_polygon, network_type="drive", simplify=True
-        )
-        # Stamp every edge with speed (km/h) and travel_time (seconds) so
-        # apply_osm_ai_times can use real free-flow times as its baseline.
-        osm_graph = ox.add_edge_speeds(osm_graph)
-        osm_graph = ox.add_edge_travel_times(osm_graph)
-        logger.info(
-            f"OSM graph loaded: {len(osm_graph.nodes)} nodes, "
-            f"{len(osm_graph.edges)} edges"
-        )
-    except Exception as e:
-        logger.error(f"Failed to load OSM graph: {e}")
-        osm_graph = None
-
-    model = TrafficPredictorGNN(node_features=7, hidden_dim=32)
-    model.load_state_dict(torch.load("traffic_gnn_weights.pth", map_location=device))
-    model.to(device).eval()
-    logger.info("All AI assets loaded successfully.")
-
-class TrafficPoint(BaseModel):
-    lat: float; lng: float
-
-class RouteRequest(BaseModel):
-    custom_traffic: List[TrafficPoint]
-    start_pt: Optional[TrafficPoint] = None
-    end_pt: Optional[TrafficPoint] = None
-
-'''
-In-flight code
-@app.post("/predict_route")
-async def predict_route(req: RouteRequest):
-    global edge_index, node_coords, kdtree, nx_graph, osm_graph
-    
-    if edge_index is None:
-        return {"error": "Model not initialized"}
-
-    num_nodes = node_coords.shape[0]
-    current_state = np.ones((num_nodes, 7), dtype=np.float32) 
-
-    bottleneck_indices = []
-    if req.custom_traffic:
-        for point in req.custom_traffic:
-            _, node_idx = kdtree.query([point.lat, point.lng])
-            node_idx = int(node_idx)
-            current_state[node_idx, 0:4] = 0.1 
-            bottleneck_indices.append(node_idx)
-
-    # ---------------------------------------------------------
-    # 1. PREPARE THE HANDSHAKE (Clear stale simulator data)
-    # ---------------------------------------------------------
-    # Update this path to exactly where your external simulator drops the output
-    sim_out_path = "simulator/output.mif" 
-    
-    if os.path.exists(sim_out_path):
-        os.remove(sim_out_path)
-        print("Cleared old simulator output.")
-
-    # ---------------------------------------------------------
-    # 2. HOT PATCH THE NPU HARDWARE MEMORY
-    # ---------------------------------------------------------
-    patch_npu_mif(
-        current_state, 
-        edge_index.cpu().numpy(), 
-        template_path="compiler/input_template.mif", 
-        output_path="compiler/input.mif"
-    )
-    print("Patched input.mif. Waiting for external NPU simulation...")
-
-    # ---------------------------------------------------------
-    # 3. ASYNCHRONOUS WAIT LOOP (Listen for output.mif)
-    # ---------------------------------------------------------
-    timeout_seconds = 60.0
-    elapsed = 0.0
-    
-    while not os.path.exists(sim_out_path):
-        await asyncio.sleep(0.5) # Yields control back to the server so it doesn't freeze
-        elapsed += 0.5
-        if elapsed >= timeout_seconds:
-            print("Simulation timeout!")
-            return {"error": "Hardware simulation timed out after 60 seconds."}
-
-    # Add a tiny 200ms buffer to ensure the external C++ process has fully finished writing the file
-    await asyncio.sleep(0.2)
-    print("Detected new output.mif! Decoding Silicon Output...")
-
-    # ---------------------------------------------------------
-    # 4. EXTRACT AND DECODE THE SILICON OUTPUT
-    # ---------------------------------------------------------
-    npu_preds_numpy = load_sim_output(sim_out_path, num_nodes=num_nodes)
-    
-    # Convert back to a PyTorch tensor so the routing logic works seamlessly
-    pred_ratio = torch.tensor(npu_preds_numpy).to(device)
-
-    # Re-pin the manual bottlenecks just to be safe
-    if req.custom_traffic:
-        for idx in bottleneck_indices:
-            pred_ratio[idx, 0] = 0.1 
-
-    all_ratios = pred_ratio.squeeze().cpu().numpy()
-    travel_data = {"standard_time_min": 0, "ai_time_min": 0, "std_route": [], "ai_route": []}
-
-    # ... [Keep the rest of your NetworkX shortest_path logic exactly the same] ...
-'''
+# ──────────────────────────────────────────────────────────────────────────────
+# PyTorch Inference (fallback)
+# ──────────────────────────────────────────────────────────────────────────────
 
 def _run_pytorch_inference(current_state: np.ndarray) -> np.ndarray:
-    """Run the PyTorch GNN model locally. Used as primary inference or NPU fallback."""
+    """Run the PyTorch GNN model locally."""
     x = torch.tensor(current_state, dtype=torch.float32).to(device)
     with torch.no_grad():
         pred = model(x, edge_index)
     return pred.squeeze().cpu().numpy()
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Startup — Load All Assets
+# ──────────────────────────────────────────────────────────────────────────────
+
+@app.on_event("startup")
+async def load_ai_assets():
+    global model, edge_index, node_coords, kdtree, nx_graph, osm_graph
+
+    logger.info("Loading AI assets...")
+    t0 = time.perf_counter()
+
+    dataset = load_toronto_traffic_data()
+    edge_index = next(iter(dataset)).edge_index.to(device)
+
+    df = pd.read_csv("svc_raw_data_speed_2020_2024.csv")
+    df = df[
+        (df["latitude"] >= 43.643)
+        & (df["latitude"] <= 43.658)
+        & (df["longitude"] >= -79.395)
+        & (df["longitude"] <= -79.370)
+    ]
+    nodes_df = (
+        df.drop_duplicates(subset=["centreline_id"])[
+            ["centreline_id", "latitude", "longitude"]
+        ]
+        .sort_values("centreline_id")
+        .reset_index(drop=True)
+    )
+    node_coords = nodes_df[["latitude", "longitude"]].values
+    kdtree = KDTree(node_coords)
+    nx_graph = build_routing_graph(edge_index.cpu().numpy(), node_coords)
+
+    try:
+        import osmnx as ox
+        from shapely.geometry import box as shapely_box
+
+        bbox_polygon = shapely_box(-79.395, 43.643, -79.370, 43.658)
+        osm_graph = ox.graph_from_polygon(
+            bbox_polygon, network_type="drive", simplify=True
+        )
+        osm_graph = ox.add_edge_speeds(osm_graph)
+        osm_graph = ox.add_edge_travel_times(osm_graph)
+        logger.info(
+            f"OSM graph: {len(osm_graph.nodes)} nodes, {len(osm_graph.edges)} edges"
+        )
+    except Exception as e:
+        logger.error(f"OSM graph load failed: {e}")
+        osm_graph = None
+
+    model = TrafficPredictorGNN(node_features=7, hidden_dim=32)
+    model.load_state_dict(
+        torch.load("traffic_gnn_weights.pth", map_location=device)
+    )
+    model.to(device).eval()
+
+    elapsed = time.perf_counter() - t0
+    logger.info(f"All assets loaded in {elapsed:.1f}s  ({len(node_coords)} nodes)")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Static File Serving
+# ──────────────────────────────────────────────────────────────────────────────
+
+@app.get("/")
+async def serve_frontend():
+    return FileResponse("index.html")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Health / Info Endpoint
+# ──────────────────────────────────────────────────────────────────────────────
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "model_loaded": model is not None,
+        "osm_graph_loaded": osm_graph is not None,
+        "num_nodes": len(node_coords) if node_coords is not None else 0,
+        "device": str(device),
+        "npu_target": "Intel Stratix 10 NX",
+        "npu_remote": f"{REMOTE_USER}@{REMOTE_HOST}",
+        "bf16_word_width": NPU_WORD_BITS,
+        "vector_lanes": DOTW,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Request / Response Models
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TrafficPoint(BaseModel):
+    lat: float
+    lng: float
+
+
+class RouteRequest(BaseModel):
+    custom_traffic: List[TrafficPoint]
+    start_pt: Optional[TrafficPoint] = None
+    end_pt: Optional[TrafficPoint] = None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Main Prediction Endpoint
+# ──────────────────────────────────────────────────────────────────────────────
+
 @app.post("/predict_route")
 async def predict_full_map(req: RouteRequest):
     loop = asyncio.get_event_loop()
     num_nodes = len(node_coords)
+    pipeline_timing: Dict[str, float] = {}
+    pipeline_t0 = time.perf_counter()
 
-    # ------------------------------------------------------------------
+    if node_coords is None or model is None:
+        return {"status": "error", "detail": "Server still loading — try again in a few seconds."}
+
+    # ──────────────────────────────────────────────────────────────────
     # 1. Build 7-channel node feature tensor
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────
+    t0 = time.perf_counter()
     current_state = np.ones((num_nodes, 7), dtype=np.float32)
 
-    # FIX: Use actual wall-clock time instead of hard-coded 5 PM rush hour.
     now = datetime.now()
     time_mins = now.hour * 60 + now.minute
     current_state[:, 4] = np.sin(2 * np.pi * time_mins / 1440.0)
     current_state[:, 5] = np.cos(2 * np.pi * time_mins / 1440.0)
-    current_state[:, 6] = float(now.weekday() >= 5)   # 1.0 = weekend
+    current_state[:, 6] = float(now.weekday() >= 5)
 
-    # Inject user-drawn congestion points (force 4-step history to gridlock)
-    bottleneck_indices = []
+    # Inject user-drawn congestion
+    bottleneck_indices: list = []
     for point in req.custom_traffic:
         _, node_idx = kdtree.query([point.lat, point.lng])
         node_idx = int(node_idx)
-        current_state[node_idx, 0:4] = 0.1   # severe gridlock speed ratio
+        current_state[node_idx, 0:4] = 0.1
         bottleneck_indices.append(node_idx)
 
-    # ------------------------------------------------------------------
-    # 2. Hot-patch the NPU hardware input MIF
-    # ------------------------------------------------------------------
-    sim_done_path  = "sim_done"
-    out_file_path  = "out_file"
+    pipeline_timing["feature_build_ms"] = round((time.perf_counter() - t0) * 1000, 2)
+
+    # ──────────────────────────────────────────────────────────────────
+    # 2. Hot-patch NPU input MIF
+    # ──────────────────────────────────────────────────────────────────
+    t0 = time.perf_counter()
+    sim_done_path = "sim_done"
+    out_file_path = "out_file"
     local_out_file = "out_file"
 
     for stale in (sim_done_path, out_file_path):
@@ -510,39 +588,48 @@ async def predict_full_map(req: RouteRequest):
         current_state,
         edge_index.cpu().numpy(),
         template_path="input_template.mif",
-        output_path="input.mif"
+        output_path="input.mif",
     )
-    logger.info("Patched input.mif — pushing to remote NPU server...")
+    pipeline_timing["mif_patch_ms"] = round((time.perf_counter() - t0) * 1000, 2)
 
-    # ------------------------------------------------------------------
-    # 3. Transfer MIF to remote server (non-blocking, runs in thread)
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────
+    # 3. Transfer MIF to remote FPGA (non-blocking)
+    # ──────────────────────────────────────────────────────────────────
     npu_available = True
+    inference_source = "npu"
+
+    t0 = time.perf_counter()
     try:
-        await loop.run_in_executor(None, transfer_mif_to_remote, "input.mif")
+        scp_elapsed = await loop.run_in_executor(
+            None, transfer_mif_to_remote, "input.mif"
+        )
+        pipeline_timing["scp_transfer_ms"] = round(scp_elapsed * 1000, 2)
     except Exception as e:
-        logger.warning(f"Remote transfer failed ({e}). Will fall back to PyTorch.")
+        logger.warning(f"SCP failed ({e}) — falling back to PyTorch")
+        pipeline_timing["scp_transfer_ms"] = round(
+            (time.perf_counter() - t0) * 1000, 2
+        )
         npu_available = False
 
-    # ------------------------------------------------------------------
-    # 4. Poll remote for sim_done (async, non-blocking SSH check)
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────
+    # 4. Poll remote for simulation completion
+    # ──────────────────────────────────────────────────────────────────
     all_ratios: np.ndarray
 
     if npu_available:
         remote_host = f"{REMOTE_USER}@{REMOTE_HOST}"
-        remote_sim_done_path = f"{REMOTE_BASE}/sim_done"
+        remote_sim_done = f"{REMOTE_BASE}/sim_done"
         remote_out_file = f"{REMOTE_USER}@{REMOTE_HOST}:{REMOTE_BASE}/out_file"
 
+        t0 = time.perf_counter()
         timeout_seconds = 120.0
         elapsed = 0.0
         simulation_finished = False
 
         while elapsed < timeout_seconds:
-            # Run the SSH test in a thread so the event loop stays free
             check_cmd = [
                 "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
-                remote_host, "test", "-f", remote_sim_done_path
+                remote_host, "test", "-f", remote_sim_done,
             ]
             result = await loop.run_in_executor(
                 None, lambda: subprocess.run(check_cmd, capture_output=True)
@@ -553,43 +640,52 @@ async def predict_full_map(req: RouteRequest):
             await asyncio.sleep(0.5)
             elapsed += 0.5
 
+        pipeline_timing["simulation_wait_ms"] = round(
+            (time.perf_counter() - t0) * 1000, 2
+        )
+
         if not simulation_finished:
-            logger.warning("NPU simulation timed out. Falling back to PyTorch model.")
+            logger.warning("NPU simulation timed out — falling back to PyTorch")
             npu_available = False
         else:
-            # ----------------------------------------------------------
-            # 5a. Fetch and decode hardware output
-            # ----------------------------------------------------------
-            logger.info("sim_done detected — fetching output from remote server...")
+            # ──────────────────────────────────────────────────────────
+            # 5a. Fetch hardware output
+            # ──────────────────────────────────────────────────────────
+            t0 = time.perf_counter()
             try:
                 await loop.run_in_executor(
                     None,
                     lambda: subprocess.run(
-                        ["scp", "-o", "BatchMode=yes", remote_out_file, local_out_file],
-                        check=True, timeout=30
-                    )
+                        [
+                            "scp", "-o", "BatchMode=yes",
+                            remote_out_file, local_out_file,
+                        ],
+                        check=True,
+                        timeout=30,
+                    ),
+                )
+                pipeline_timing["fetch_output_ms"] = round(
+                    (time.perf_counter() - t0) * 1000, 2
                 )
             except Exception as e:
-                logger.warning(f"Failed to fetch NPU output ({e}). Falling back to PyTorch.")
+                logger.warning(f"Failed to fetch NPU output ({e})")
+                pipeline_timing["fetch_output_ms"] = round(
+                    (time.perf_counter() - t0) * 1000, 2
+                )
                 npu_available = False
 
+    # ──────────────────────────────────────────────────────────────────
+    # 5b. Decode NPU output
+    # ──────────────────────────────────────────────────────────────────
     if npu_available:
+        t0 = time.perf_counter()
         npu_preds = parse_raw_hex_output(local_out_file, num_nodes=num_nodes)
+        pipeline_timing["decode_bf16_ms"] = round(
+            (time.perf_counter() - t0) * 1000, 2
+        )
 
-        # ------------------------------------------------------------------
-        # 5b. Validate NPU output — only reject on hard failures (NaN/Inf).
-        #
-        # Previously a std > 1e-4 gate was applied here, which caused the
-        # system to reject legitimate NPU outputs that happened to be tightly
-        # clustered (e.g. a quiet traffic period) and silently substitute
-        # PyTorch predictions.  Per the project requirement, predictions MUST
-        # come from the NPU hardware out_file; PyTorch is only a last resort
-        # for SSH/SCP failures, timeouts, and corrupt (non-finite) data.
-        # ------------------------------------------------------------------
         if not np.isfinite(npu_preds).all():
-            logger.warning(
-                "NPU output contains NaN/Inf values — falling back to PyTorch."
-            )
+            logger.warning("NPU output contains NaN/Inf — falling back to PyTorch")
             npu_available = False
         else:
             logger.info(
@@ -599,97 +695,144 @@ async def predict_full_map(req: RouteRequest):
                 f"range=[{npu_preds.min():.4f}, {npu_preds.max():.4f}]"
             )
             all_ratios = npu_preds
+            inference_source = "npu"
 
+    # ──────────────────────────────────────────────────────────────────
+    # 5c. PyTorch fallback (SSH/SCP failure, timeout, NaN/Inf only)
+    # ──────────────────────────────────────────────────────────────────
     if not npu_available:
-        # ------------------------------------------------------------------
-        # 5c. PyTorch fallback — only reached on SSH/SCP failure, timeout,
-        #     or corrupt (non-finite) NPU output.
-        # ------------------------------------------------------------------
+        t0 = time.perf_counter()
         logger.info("Running PyTorch GNN inference (fallback)...")
-        all_ratios = await loop.run_in_executor(None, _run_pytorch_inference, current_state)
+        all_ratios = await loop.run_in_executor(
+            None, _run_pytorch_inference, current_state
+        )
+        pipeline_timing["pytorch_inference_ms"] = round(
+            (time.perf_counter() - t0) * 1000, 2
+        )
+        inference_source = "pytorch"
 
-    # ------------------------------------------------------------------
-    # 6. Re-pin user congestion nodes (guarantee bottlenecks are honoured)
-    # FIX: pred_ratio is a 1-D array; indexing with [idx, 0] raises IndexError.
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────
+    # 6. Re-pin user congestion nodes
+    # ──────────────────────────────────────────────────────────────────
     for idx in bottleneck_indices:
         all_ratios[idx] = 0.1
 
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────
     # 7. Compute OSM routes
-    # ------------------------------------------------------------------
-    # Haversine straight-line estimate used as a fallback floor so the UI
-    # never shows "0 Minutes" even when graph routing is unavailable.
+    # ──────────────────────────────────────────────────────────────────
     routing_status = "ok"
-    direct_dist_m  = 0.0
+    direct_dist_m = 0.0
     if req.start_pt and req.end_pt:
         direct_dist_m = haversine_m(
             req.start_pt.lat, req.start_pt.lng,
-            req.end_pt.lat,   req.end_pt.lng
+            req.end_pt.lat, req.end_pt.lng,
         )
-    # Assume average city speed of 25 km/h for the straight-line fallback
     fallback_min = max(1, int(direct_dist_m / (25_000 / 3600) / 60))
 
     travel_data = {
         "standard_time_min": fallback_min,
-        "ai_time_min":       fallback_min,
-        "std_route":         [],
-        "ai_route":          [],
+        "ai_time_min": fallback_min,
+        "std_route": [],
+        "ai_route": [],
     }
 
     if req.start_pt and req.end_pt and osm_graph is not None:
+        t0 = time.perf_counter()
         try:
-            orig = _osmnx_nearest_nodes(osm_graph, req.start_pt.lng, req.start_pt.lat)
-            dest = _osmnx_nearest_nodes(osm_graph, req.end_pt.lng,   req.end_pt.lat)
+            orig = _osmnx_nearest_nodes(
+                osm_graph, req.start_pt.lng, req.start_pt.lat
+            )
+            dest = _osmnx_nearest_nodes(
+                osm_graph, req.end_pt.lng, req.end_pt.lat
+            )
 
             if orig == dest:
-                raise ValueError("Origin and destination map to the same OSM node — "
-                                 "try placing markers further apart.")
+                raise ValueError(
+                    "Origin and destination map to the same OSM node"
+                )
 
             apply_osm_ai_times(osm_graph, kdtree, all_ratios)
 
-            std_path = nx.shortest_path(osm_graph, orig, dest, weight="std_time_sec")
-            ai_path  = nx.shortest_path(osm_graph, orig, dest, weight="ai_time_sec")
+            std_path = nx.shortest_path(
+                osm_graph, orig, dest, weight="std_time_sec"
+            )
+            ai_path = nx.shortest_path(
+                osm_graph, orig, dest, weight="ai_time_sec"
+            )
 
-            travel_data["std_route"], _          = get_osm_path_data(osm_graph, std_path, "std_time_sec")
-            travel_data["ai_route"],  ai_sec     = get_osm_path_data(osm_graph, ai_path,  "ai_time_sec")
-            _,                        std_ai_sec = get_osm_path_data(osm_graph, std_path, "ai_time_sec")
+            travel_data["std_route"], _ = get_osm_path_data(
+                osm_graph, std_path, "std_time_sec"
+            )
+            travel_data["ai_route"], ai_sec = get_osm_path_data(
+                osm_graph, ai_path, "ai_time_sec"
+            )
+            _, std_ai_sec = get_osm_path_data(
+                osm_graph, std_path, "ai_time_sec"
+            )
 
-            # BUG FIX: max(1, ...) was inside the try block, so it never ran
-            # when an exception was raised.  It is now always applied below.
             travel_data["standard_time_min"] = int(std_ai_sec // 60)
-            travel_data["ai_time_min"]       = int(ai_sec     // 60)
+            travel_data["ai_time_min"] = int(ai_sec // 60)
+
             logger.info(
-                f"Routes computed: std={travel_data['standard_time_min']} min, "
-                f"ai={travel_data['ai_time_min']} min  "
-                f"(nodes: {orig}→{dest}, path len std={len(std_path)}, ai={len(ai_path)})"
+                f"Routes: std={travel_data['standard_time_min']}min  "
+                f"ai={travel_data['ai_time_min']}min  "
+                f"(path len std={len(std_path)}, ai={len(ai_path)})"
             )
         except Exception as e:
             routing_status = f"routing_error: {e}"
             logger.error(f"OSM routing failed: {e}")
-            # travel_data retains the haversine fallback values set above
+
+        pipeline_timing["routing_ms"] = round(
+            (time.perf_counter() - t0) * 1000, 2
+        )
     elif osm_graph is None:
         routing_status = "osm_graph_unavailable"
-        logger.error("OSM graph not loaded — using haversine fallback for time estimate.")
 
-    # Apply floor AFTER the try/except so it always executes regardless of routing outcome
+    # Always enforce minimum 1 minute
     travel_data["standard_time_min"] = max(1, travel_data["standard_time_min"])
-    travel_data["ai_time_min"]       = max(1, travel_data["ai_time_min"])
+    travel_data["ai_time_min"] = max(1, travel_data["ai_time_min"])
 
-    # Invert speed ratio for Deck.gl heatmap (low speed → high congestion weight)
-    results = [
+    # ──────────────────────────────────────────────────────────────────
+    # 8. Build response
+    # ──────────────────────────────────────────────────────────────────
+    pipeline_timing["total_ms"] = round(
+        (time.perf_counter() - pipeline_t0) * 1000, 2
+    )
+
+    # Invert speed ratio for heatmap (low speed → high congestion)
+    predictions = [
         {
-            "lat":        float(node_coords[i][0]),
-            "lng":        float(node_coords[i][1]),
-            "congestion": round(1.0 - float(np.clip(all_ratios[i], 0.1, 1.0)), 3)
+            "lat": float(node_coords[i][0]),
+            "lng": float(node_coords[i][1]),
+            "congestion": round(
+                1.0 - float(np.clip(all_ratios[i], 0.1, 1.0)), 3
+            ),
         }
         for i in range(num_nodes)
     ]
-    inference_source = "npu" if npu_available else "pytorch_fallback"
+
+    # Compute time savings percentage
+    std_min = travel_data["standard_time_min"]
+    ai_min = travel_data["ai_time_min"]
+    savings_pct = (
+        round((1.0 - ai_min / std_min) * 100, 1) if std_min > 0 else 0.0
+    )
+
     return {
-        "predictions":      results,
-        "travel":           travel_data,
-        "status":           "success",
+        "predictions": predictions,
+        "travel": travel_data,
+        "status": "success",
         "inference_source": inference_source,
-        "routing_status":   routing_status,
+        "routing_status": routing_status,
+        "time_savings_pct": savings_pct,
+        "pipeline": pipeline_timing,
+        "hardware": {
+            "target": "Intel Stratix 10 NX",
+            "word_width": NPU_WORD_BITS,
+            "precision": "BFloat16",
+            "vector_lanes": DOTW,
+            "cores": NCORE,
+            "num_nodes": num_nodes,
+            "num_congestion_points": len(bottleneck_indices),
+        },
     }

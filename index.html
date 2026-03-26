@@ -2,81 +2,460 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>AI ETA Predictor</title>
+    <title>NPU Traffic Prediction — Stratix 10 NX</title>
     <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
     <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
     <script src="https://unpkg.com/deck.gl@8.9.0/dist.min.js"></script>
     <style>
-        body { margin: 0; padding: 0; font-family: 'Segoe UI', system-ui, sans-serif; background: #0b0f19; overflow: hidden; color: #fff; }
-        #map { width: 100vw; height: 100vh; position: absolute; top: 0; left: 0; }
-        
-        #panel { position: absolute; top: 20px; left: 20px; background: rgba(15, 20, 35, 0.85); padding: 25px; border-radius: 12px; border: 1px solid rgba(255,255,255,0.1); z-index: 10; width: 340px; box-shadow: 0 10px 40px rgba(0,0,0,0.8); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); transition: all 0.3s ease; }
-        
-        h2 { margin: 0 0 5px 0; font-size: 20px; color: #00d2ff; }
-        p { color: #8892b0; font-size: 13px; margin-bottom: 20px; line-height: 1.5; }
-        
-        .tools { display: grid; grid-template-columns: 1fr; gap: 8px; margin-bottom: 20px; }
-        
-        button { padding: 12px; font-size: 14px; cursor: pointer; background: #1e293b; color: #fff; border: 1px solid #475569; border-radius: 6px; font-weight: 600; transition: all 0.15s cubic-bezier(0.4, 0, 0.2, 1); text-align: left;}
-        button:hover:not(:disabled) { background: #334155; transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0,0,0,0.2); }
-        button:active:not(:disabled) { transform: translateY(1px); }
-        button.active { background: rgba(0, 210, 255, 0.15); color: #00d2ff; border-color: #00d2ff; box-shadow: inset 0 0 0 1px #00d2ff; }
-        
-        .btn-predict { width: 100%; background: #10b981; color: #000; border: none; font-size: 16px; padding: 15px; text-align: center; margin-bottom: 10px; transition: all 0.2s ease; }
-        .btn-predict:hover:not(:disabled) { background: #059669; box-shadow: 0 0 20px rgba(16, 185, 129, 0.4); }
-        .btn-predict:disabled { background: #334155; color: #94a3b8; cursor: not-allowed; transform: none; box-shadow: none; }
-        
-        .btn-clear { width: 100%; background: transparent; border: 1px dashed #64748b; color: #94a3b8; text-align: center; }
-        .btn-clear:hover { border-color: #ef4444; color: #ef4444; background: rgba(239, 68, 68, 0.1); }
-        
-        @keyframes slideUpFade {
-            from { opacity: 0; transform: translateY(15px) scale(0.98); }
-            to { opacity: 1; transform: translateY(0) scale(1); }
+        :root {
+            --accent: #00d2ff;
+            --accent-glow: rgba(0, 210, 255, 0.35);
+            --green: #10b981;
+            --red: #ef4444;
+            --amber: #f59e0b;
+            --purple: #8b5cf6;
+            --bg-panel: rgba(8, 12, 24, 0.92);
+            --bg-card: rgba(255,255,255,0.04);
+            --border: rgba(255,255,255,0.08);
+            --text-dim: #64748b;
+            --text-mid: #94a3b8;
+            --text-bright: #e2e8f0;
         }
-        
-        #eta-dashboard { display: none; margin-top: 20px; padding: 18px; background: rgba(0,0,0,0.4); border-radius: 8px; border: 1px solid rgba(255,255,255,0.05); box-shadow: inset 0 2px 10px rgba(0,0,0,0.2); animation: slideUpFade 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards; }
-        .eta-title { font-size: 11px; color: #94a3b8; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 5px; }
-        .eta-value { font-size: 36px; font-weight: 800; color: #00d2ff; margin-bottom: 15px; text-shadow: 0 0 20px rgba(0, 210, 255, 0.4); }
-        .eta-sub { font-size: 14px; color: #ef4444; font-weight: 600;}
-        
-        #status { margin-top: 15px; font-size: 12px; color: #10b981; text-align: center; font-family: monospace; }
-        
-        #tooltip { position: absolute; z-index: 999; pointer-events: none; display: none; background: rgba(15, 20, 35, 0.95); padding: 8px 12px; border: 1px solid #475569; border-radius: 6px; color: #fff; font-size: 12px; font-family: monospace; box-shadow: 0 4px 15px rgba(0,0,0,0.5); backdrop-filter: blur(4px); transform: translate(-50%, -120%); white-space: nowrap;}
-        
-        .legend-dot { display: inline-block; width: 10px; height: 10px; background: rgba(0, 210, 255, 0.2); border: 1px solid #00d2ff; margin-right: 5px; vertical-align: middle; }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: 'SF Pro Display', -apple-system, 'Segoe UI', system-ui, sans-serif;
+            background: #060a14;
+            color: #fff;
+            overflow: hidden;
+        }
+
+        #map { width: 100vw; height: 100vh; position: absolute; top: 0; left: 0; }
+
+        /* ── Tooltip ─────────────────────────────────────── */
+        #tooltip {
+            position: absolute; z-index: 999; pointer-events: none; display: none;
+            background: var(--bg-panel); padding: 8px 12px; border: 1px solid var(--border);
+            border-radius: 8px; color: #fff; font-size: 11px; font-family: 'SF Mono', monospace;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.6); backdrop-filter: blur(8px);
+            transform: translate(-50%, -120%); white-space: nowrap;
+        }
+
+        /* ── Left Panel ──────────────────────────────────── */
+        #panel {
+            position: absolute; top: 20px; left: 20px;
+            background: var(--bg-panel);
+            padding: 24px; border-radius: 16px;
+            border: 1px solid var(--border);
+            z-index: 10; width: 340px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.7);
+            backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
+        }
+
+        .panel-header {
+            display: flex; align-items: center; gap: 10px;
+            margin-bottom: 4px;
+        }
+        .panel-header h2 {
+            font-size: 18px; font-weight: 700; color: #fff;
+            letter-spacing: -0.3px;
+        }
+        .chip {
+            font-size: 9px; font-weight: 700; letter-spacing: 0.5px;
+            padding: 3px 8px; border-radius: 4px;
+            background: rgba(0, 210, 255, 0.15); color: var(--accent);
+            text-transform: uppercase;
+        }
+        .subtitle {
+            font-size: 12px; color: var(--text-dim); margin-bottom: 20px; line-height: 1.6;
+        }
+
+        /* ── Tool Buttons ────────────────────────────────── */
+        .tools { display: flex; flex-direction: column; gap: 6px; margin-bottom: 16px; }
+
+        .tool-btn {
+            display: flex; align-items: center; gap: 10px;
+            padding: 10px 14px; font-size: 13px; font-weight: 600;
+            cursor: pointer; background: var(--bg-card);
+            color: var(--text-mid); border: 1px solid var(--border);
+            border-radius: 10px; transition: all 0.15s ease;
+            font-family: inherit;
+        }
+        .tool-btn:hover { background: rgba(255,255,255,0.08); color: #fff; }
+        .tool-btn.active {
+            background: rgba(0, 210, 255, 0.1); color: var(--accent);
+            border-color: rgba(0, 210, 255, 0.3);
+            box-shadow: inset 0 0 0 1px rgba(0, 210, 255, 0.15);
+        }
+        .tool-icon {
+            width: 28px; height: 28px; border-radius: 8px;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 14px; flex-shrink: 0;
+        }
+        .tool-label { flex: 1; }
+        .tool-hint {
+            font-size: 10px; color: var(--text-dim); font-weight: 400;
+        }
+
+        /* ── Action Buttons ──────────────────────────────── */
+        .btn-predict {
+            width: 100%; padding: 14px; font-size: 15px; font-weight: 700;
+            cursor: pointer; border: none; border-radius: 10px;
+            font-family: inherit; transition: all 0.2s ease;
+            background: linear-gradient(135deg, var(--accent), #0091ff);
+            color: #000; margin-bottom: 8px;
+            box-shadow: 0 4px 16px var(--accent-glow);
+        }
+        .btn-predict:hover:not(:disabled) {
+            transform: translateY(-1px);
+            box-shadow: 0 8px 30px var(--accent-glow);
+        }
+        .btn-predict:disabled {
+            background: rgba(255,255,255,0.06); color: var(--text-dim);
+            cursor: not-allowed; box-shadow: none; transform: none;
+        }
+
+        .btn-clear {
+            width: 100%; padding: 10px; font-size: 13px; font-weight: 500;
+            cursor: pointer; background: transparent;
+            border: 1px dashed rgba(255,255,255,0.12); border-radius: 8px;
+            color: var(--text-dim); font-family: inherit;
+            transition: all 0.15s ease;
+        }
+        .btn-clear:hover {
+            border-color: var(--red); color: var(--red);
+            background: rgba(239, 68, 68, 0.08);
+        }
+
+        /* ── Results Dashboard ───────────────────────────── */
+        @keyframes slideUp {
+            from { opacity: 0; transform: translateY(12px); }
+            to   { opacity: 1; transform: translateY(0); }
+        }
+
+        #results {
+            display: none; margin-top: 20px;
+            animation: slideUp 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+        }
+
+        .results-grid {
+            display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
+            margin-bottom: 14px;
+        }
+
+        .metric-card {
+            background: var(--bg-card); border: 1px solid var(--border);
+            border-radius: 10px; padding: 14px;
+        }
+        .metric-label {
+            font-size: 10px; font-weight: 600; color: var(--text-dim);
+            text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 6px;
+        }
+        .metric-value {
+            font-size: 28px; font-weight: 800; letter-spacing: -1px;
+        }
+        .metric-value.accent { color: var(--accent); }
+        .metric-value.red { color: var(--red); }
+        .metric-unit { font-size: 14px; font-weight: 500; opacity: 0.7; }
+
+        .savings-banner {
+            display: flex; align-items: center; justify-content: center;
+            gap: 8px; padding: 10px; border-radius: 8px;
+            background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.2);
+            margin-bottom: 14px;
+        }
+        .savings-banner .icon { font-size: 18px; }
+        .savings-banner .text {
+            font-size: 13px; font-weight: 700; color: var(--green);
+        }
+
+        /* ── Right Panel: Hardware Telemetry ──────────────── */
+        #hw-panel {
+            position: absolute; top: 20px; right: 20px;
+            background: var(--bg-panel);
+            padding: 20px; border-radius: 16px;
+            border: 1px solid var(--border);
+            z-index: 10; width: 280px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.7);
+            backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
+        }
+
+        .hw-header {
+            display: flex; align-items: center; gap: 8px;
+            margin-bottom: 16px;
+        }
+        .hw-header h3 {
+            font-size: 13px; font-weight: 700; color: var(--text-bright);
+            letter-spacing: -0.2px;
+        }
+        .status-dot {
+            width: 8px; height: 8px; border-radius: 50%;
+            background: var(--green); flex-shrink: 0;
+            box-shadow: 0 0 8px rgba(16, 185, 129, 0.6);
+        }
+        .status-dot.idle { background: var(--text-dim); box-shadow: none; }
+        .status-dot.running {
+            background: var(--amber);
+            box-shadow: 0 0 8px rgba(245, 158, 11, 0.6);
+            animation: pulse 1.2s ease-in-out infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+
+        /* ── Pipeline Steps ──────────────────────────────── */
+        .pipeline { display: flex; flex-direction: column; gap: 0; margin-bottom: 16px; }
+
+        .pipe-step {
+            display: flex; align-items: center; gap: 10px;
+            padding: 8px 0; position: relative;
+        }
+        .pipe-step:not(:last-child)::after {
+            content: ''; position: absolute;
+            left: 11px; top: 32px; bottom: -8px;
+            width: 1px; background: var(--border);
+        }
+
+        .pipe-dot {
+            width: 22px; height: 22px; border-radius: 6px;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 11px; flex-shrink: 0; z-index: 1;
+            background: rgba(255,255,255,0.05); border: 1px solid var(--border);
+            color: var(--text-dim);
+        }
+        .pipe-dot.done { background: rgba(16,185,129,0.15); border-color: rgba(16,185,129,0.3); color: var(--green); }
+        .pipe-dot.active { background: rgba(0,210,255,0.15); border-color: rgba(0,210,255,0.3); color: var(--accent); animation: pulse 1s ease infinite; }
+        .pipe-dot.error { background: rgba(239,68,68,0.15); border-color: rgba(239,68,68,0.3); color: var(--red); }
+
+        .pipe-info { flex: 1; min-width: 0; }
+        .pipe-name { font-size: 12px; font-weight: 600; color: var(--text-mid); }
+        .pipe-time { font-size: 10px; color: var(--text-dim); font-family: 'SF Mono', monospace; }
+
+        /* ── Hardware Specs ───────────────────────────────── */
+        .hw-specs {
+            display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
+            padding-top: 14px; border-top: 1px solid var(--border);
+        }
+        .spec-item {}
+        .spec-label { font-size: 9px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.5px; }
+        .spec-value { font-size: 12px; font-weight: 600; color: var(--text-bright); margin-top: 2px; }
+
+        /* ── Inference Badge ──────────────────────────────── */
+        .inference-badge {
+            display: flex; align-items: center; justify-content: center;
+            gap: 6px; padding: 8px 12px; border-radius: 8px;
+            margin-bottom: 14px; font-size: 12px; font-weight: 700;
+        }
+        .inference-badge.npu {
+            background: rgba(0, 210, 255, 0.1);
+            border: 1px solid rgba(0, 210, 255, 0.2);
+            color: var(--accent);
+        }
+        .inference-badge.pytorch {
+            background: rgba(245, 158, 11, 0.1);
+            border: 1px solid rgba(245, 158, 11, 0.2);
+            color: var(--amber);
+        }
+
+        /* ── Status Bar ──────────────────────────────────── */
+        #status {
+            margin-top: 14px; font-size: 11px; color: var(--text-dim);
+            text-align: center; font-family: 'SF Mono', monospace;
+        }
+
+        /* ── Zone Legend ──────────────────────────────────── */
+        .legend {
+            display: flex; align-items: center; gap: 6px;
+            margin-top: 10px; padding: 8px 12px;
+            background: var(--bg-card); border-radius: 8px;
+            border: 1px solid var(--border);
+        }
+        .legend-dot {
+            width: 10px; height: 10px; border-radius: 3px;
+            background: rgba(0, 210, 255, 0.2); border: 1px solid var(--accent);
+        }
+        .legend-text { font-size: 10px; color: var(--text-dim); }
+
+        /* ── Loading Overlay ──────────────────────────────── */
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .spinner {
+            width: 16px; height: 16px; border: 2px solid var(--border);
+            border-top-color: var(--accent); border-radius: 50%;
+            animation: spin 0.8s linear infinite; display: inline-block;
+            vertical-align: middle; margin-right: 8px;
+        }
+
+        /* ── Route animation ─────────────────────────────── */
+        @keyframes dashOffset {
+            to { stroke-dashoffset: -100; }
+        }
     </style>
 </head>
 <body>
     <div id="map"></div>
     <div id="tooltip"></div>
-    
+
+    <!-- ═══════════ LEFT PANEL ═══════════ -->
     <div id="panel">
-        <h2>AI ETA Engine</h2>
-        <p>
-            NPU spatial matrix prediction for real-time dynamic pathfinding.<br>
-            <span style="font-size: 11px; color: #94a3b8; display: block; margin-top: 8px;">
-                <span class="legend-dot"></span>Valid AI Training Zone
-            </span>
+        <div class="panel-header">
+            <h2>NPU ETA Engine</h2>
+            <span class="chip">Live</span>
+        </div>
+        <p class="subtitle">
+            GNN inference on Intel Stratix 10 NX FPGA for real-time
+            traffic-aware route optimisation.
         </p>
-        
+
         <div class="tools">
-            <button id="btn-jam" class="active" onclick="setMode('jam')">🚧 1. Draw Congestion (Hold Shift)</button>
-            <button id="btn-start" onclick="setMode('start')">🟢 2. Set Origin</button>
-            <button id="btn-end" onclick="setMode('end')">🔴 3. Set Destination</button>
+            <button id="btn-jam" class="tool-btn active" onclick="setMode('jam')">
+                <div class="tool-icon">🚧</div>
+                <div>
+                    <div class="tool-label">Draw Congestion</div>
+                    <div class="tool-hint">Click or hold Shift to paint</div>
+                </div>
+            </button>
+            <button id="btn-start" class="tool-btn" onclick="setMode('start')">
+                <div class="tool-icon">🟢</div>
+                <div>
+                    <div class="tool-label">Set Origin</div>
+                    <div class="tool-hint">Click to place start point</div>
+                </div>
+            </button>
+            <button id="btn-end" class="tool-btn" onclick="setMode('end')">
+                <div class="tool-icon">🔴</div>
+                <div>
+                    <div class="tool-label">Set Destination</div>
+                    <div class="tool-hint">Click to place end point</div>
+                </div>
+            </button>
         </div>
-        
-        <button id="btn-predict" class="btn-predict" onclick="predictETA()">🚀 Calculate ETA</button>
-        <button class="btn-clear" onclick="clearMap()">🗑️ Reset Map</button>
-        
-        <div id="eta-dashboard">
-            <div class="eta-title">AI Smart Route (Detour)</div>
-            <div class="eta-value" id="ai-time">-- min</div>
-            
-            <div class="eta-title">Standard Route (Direct)</div>
-            <div class="eta-sub" id="std-time">-- min</div>
+
+        <button id="btn-predict" class="btn-predict" onclick="predictETA()">
+            Run NPU Inference
+        </button>
+        <button class="btn-clear" onclick="clearMap()">Reset Map</button>
+
+        <!-- Results -->
+        <div id="results">
+            <div id="savings-banner" class="savings-banner" style="display:none;">
+                <span class="icon">⚡</span>
+                <span class="text" id="savings-text">--</span>
+            </div>
+
+            <div class="results-grid">
+                <div class="metric-card">
+                    <div class="metric-label">AI Smart Route</div>
+                    <div class="metric-value accent" id="ai-time">--<span class="metric-unit"> min</span></div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Standard Route</div>
+                    <div class="metric-value red" id="std-time">--<span class="metric-unit"> min</span></div>
+                </div>
+            </div>
         </div>
-        
-        <div id="status">Ready for input.</div>
+
+        <div class="legend">
+            <div class="legend-dot"></div>
+            <span class="legend-text">GNN Training Zone — Downtown Toronto</span>
+        </div>
+
+        <div id="status">Ready — draw congestion, then run inference.</div>
+    </div>
+
+    <!-- ═══════════ RIGHT PANEL: HARDWARE ═══════════ -->
+    <div id="hw-panel">
+        <div class="hw-header">
+            <div class="status-dot idle" id="hw-status-dot"></div>
+            <h3>Hardware Pipeline</h3>
+        </div>
+
+        <div id="inference-badge" class="inference-badge npu" style="display:none;">
+            <span id="badge-icon">⚡</span>
+            <span id="badge-text">NPU Inference</span>
+        </div>
+
+        <div class="pipeline" id="pipeline">
+            <div class="pipe-step" id="step-features">
+                <div class="pipe-dot" id="dot-features">1</div>
+                <div class="pipe-info">
+                    <div class="pipe-name">Build Feature Tensor</div>
+                    <div class="pipe-time" id="time-features">—</div>
+                </div>
+            </div>
+            <div class="pipe-step" id="step-mif">
+                <div class="pipe-dot" id="dot-mif">2</div>
+                <div class="pipe-info">
+                    <div class="pipe-name">Patch MIF (BFloat16)</div>
+                    <div class="pipe-time" id="time-mif">—</div>
+                </div>
+            </div>
+            <div class="pipe-step" id="step-scp">
+                <div class="pipe-dot" id="dot-scp">3</div>
+                <div class="pipe-info">
+                    <div class="pipe-name">SCP → Wintermute</div>
+                    <div class="pipe-time" id="time-scp">—</div>
+                </div>
+            </div>
+            <div class="pipe-step" id="step-sim">
+                <div class="pipe-dot" id="dot-sim">4</div>
+                <div class="pipe-info">
+                    <div class="pipe-name">RTL Simulation</div>
+                    <div class="pipe-time" id="time-sim">—</div>
+                </div>
+            </div>
+            <div class="pipe-step" id="step-decode">
+                <div class="pipe-dot" id="dot-decode">5</div>
+                <div class="pipe-info">
+                    <div class="pipe-name">Decode NPU Output</div>
+                    <div class="pipe-time" id="time-decode">—</div>
+                </div>
+            </div>
+            <div class="pipe-step" id="step-route">
+                <div class="pipe-dot" id="dot-route">6</div>
+                <div class="pipe-info">
+                    <div class="pipe-name">OSM Route Planning</div>
+                    <div class="pipe-time" id="time-route">—</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="hw-specs">
+            <div class="spec-item">
+                <div class="spec-label">FPGA Target</div>
+                <div class="spec-value">Stratix 10 NX</div>
+            </div>
+            <div class="spec-item">
+                <div class="spec-label">Precision</div>
+                <div class="spec-value">BFloat16</div>
+            </div>
+            <div class="spec-item">
+                <div class="spec-label">Word Width</div>
+                <div class="spec-value">640-bit</div>
+            </div>
+            <div class="spec-item">
+                <div class="spec-label">Vector Lanes</div>
+                <div class="spec-value">40 lanes</div>
+            </div>
+            <div class="spec-item">
+                <div class="spec-label">DSP Cores</div>
+                <div class="spec-value">3 cores</div>
+            </div>
+            <div class="spec-item">
+                <div class="spec-label">GNN Model</div>
+                <div class="spec-value">3-Layer GCN</div>
+            </div>
+            <div class="spec-item">
+                <div class="spec-label">Hidden Dim</div>
+                <div class="spec-value">32</div>
+            </div>
+            <div class="spec-item">
+                <div class="spec-label">Activation</div>
+                <div class="spec-value">ReLU + Sigmoid</div>
+            </div>
+        </div>
     </div>
 
     <script>
@@ -86,45 +465,44 @@
         let inputMarkers = [];
         let startMarker = null;
         let endMarker = null;
-        
         let heatmapData = [];
         let aiRouteData = [];
         let stdRouteData = [];
 
         const tooltip = document.getElementById('tooltip');
 
-        // FIXED: The polygon ring is now explicitly closed to prevent WebGL validation errors
+        // Bounding box for the GNN training zone
         const boundingBoxData = [{
             polygon: [
-                [-79.395, 43.643], 
-                [-79.395, 43.658], 
-                [-79.370, 43.658], 
-                [-79.370, 43.643],
-                [-79.395, 43.643] // Explicit closing coordinate
+                [-79.395, 43.643], [-79.395, 43.658],
+                [-79.370, 43.658], [-79.370, 43.643],
+                [-79.395, 43.643]
             ]
         }];
 
         let isRenderPending = false;
-        
         function triggerRender() {
             if (!isRenderPending) {
                 isRenderPending = true;
-                requestAnimationFrame(() => {
-                    renderLayers();
-                    isRenderPending = false;
-                });
+                requestAnimationFrame(() => { renderLayers(); isRenderPending = false; });
             }
         }
+
+        // Animated route offset for the pulsing dash effect
+        let routeAnimOffset = 0;
+        let routeAnimId = null;
 
         const deckgl = new DeckGL({
             container: 'map',
             mapStyle: 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json',
-            initialViewState: { longitude: -79.382, latitude: 43.650, zoom: 14, pitch: 45, bearing: -10 },
+            initialViewState: {
+                longitude: -79.3825, latitude: 43.6505,
+                zoom: 14.5, pitch: 50, bearing: -15
+            },
             controller: true,
             onClick: (info) => handleMapClick(info.coordinate),
             onHover: (info) => handleHover(info),
-            // FIXED: Native DeckGL lifecycle hook instead of invalid .on() event listener
-            onLoad: () => triggerRender() 
+            onLoad: () => triggerRender()
         });
 
         let isShiftDown = false;
@@ -133,26 +511,26 @@
 
         function setMode(mode) {
             currentMode = mode;
-            ['jam', 'start', 'end'].forEach(m => document.getElementById(`btn-${m}`).classList.remove('active'));
-            document.getElementById(`btn-${mode}`).classList.add('active');
+            ['jam', 'start', 'end'].forEach(m =>
+                document.getElementById(`btn-${m}`).classList.toggle('active', m === mode)
+            );
         }
 
         function handleHover(info) {
-            if (info.object && info.layer.id === 'inputs') {
+            if (info.object && info.layer && info.layer.id === 'inputs') {
                 tooltip.style.display = 'block';
                 tooltip.style.left = `${info.x}px`;
                 tooltip.style.top = `${info.y}px`;
-                tooltip.innerHTML = `📍 Node<br>Lat: ${info.coordinate[1].toFixed(4)}<br>Lng: ${info.coordinate[0].toFixed(4)}`;
+                tooltip.innerHTML = `Lat: ${info.coordinate[1].toFixed(4)}<br>Lng: ${info.coordinate[0].toFixed(4)}`;
             } else {
                 tooltip.style.display = 'none';
             }
 
             if (isShiftDown && currentMode === 'jam' && info.coordinate) {
                 const [lng, lat] = info.coordinate;
-                const lastMarker = inputMarkers[inputMarkers.length - 1];
-                
-                if (!lastMarker || Math.abs(lastMarker.position[0] - lng) > 0.0005 || Math.abs(lastMarker.position[1] - lat) > 0.0005) {
-                    inputMarkers.push({ position: [lng, lat], color: [255, 50, 50] });
+                const last = inputMarkers[inputMarkers.length - 1];
+                if (!last || Math.abs(last.position[0] - lng) > 0.0004 || Math.abs(last.position[1] - lat) > 0.0004) {
+                    inputMarkers.push({ position: [lng, lat], color: [255, 60, 60] });
                     triggerRender();
                 }
             }
@@ -161,21 +539,108 @@
         function handleMapClick(coords) {
             if (!coords) return;
             const [lng, lat] = coords;
-            if (currentMode === 'jam') inputMarkers.push({ position: [lng, lat], color: [255, 50, 50] });
-            else if (currentMode === 'start') startMarker = { position: [lng, lat], color: [16, 185, 129] };
-            else if (currentMode === 'end') endMarker = { position: [lng, lat], color: [139, 92, 246] };
+            if (currentMode === 'jam') {
+                inputMarkers.push({ position: [lng, lat], color: [255, 60, 60] });
+            } else if (currentMode === 'start') {
+                startMarker = { position: [lng, lat], color: [16, 185, 129] };
+            } else if (currentMode === 'end') {
+                endMarker = { position: [lng, lat], color: [139, 92, 246] };
+            }
             triggerRender();
         }
 
         function clearMap() {
             inputMarkers = []; startMarker = null; endMarker = null;
             heatmapData = []; aiRouteData = []; stdRouteData = [];
-            document.getElementById('eta-dashboard').style.display = 'none';
-            document.getElementById('status').innerText = "Map cleared.";
-            document.getElementById('status').style.color = "#94a3b8";
+            document.getElementById('results').style.display = 'none';
+            document.getElementById('inference-badge').style.display = 'none';
+            setStatus('Map cleared.', 'var(--text-dim)');
+            resetPipeline();
+            if (routeAnimId) { cancelAnimationFrame(routeAnimId); routeAnimId = null; }
             triggerRender();
         }
 
+        function setStatus(text, color) {
+            const el = document.getElementById('status');
+            el.innerText = text;
+            el.style.color = color || 'var(--text-dim)';
+        }
+
+        // ── Pipeline UI ─────────────────────────────────────
+        const pipeSteps = ['features', 'mif', 'scp', 'sim', 'decode', 'route'];
+
+        function resetPipeline() {
+            pipeSteps.forEach(s => {
+                document.getElementById(`dot-${s}`).className = 'pipe-dot';
+                document.getElementById(`time-${s}`).textContent = '—';
+            });
+            document.getElementById('hw-status-dot').className = 'status-dot idle';
+        }
+
+        function setPipeStep(step, state, timeMs) {
+            const dot = document.getElementById(`dot-${step}`);
+            dot.className = `pipe-dot ${state}`;
+            if (timeMs !== undefined && timeMs !== null) {
+                document.getElementById(`time-${step}`).textContent =
+                    timeMs < 1000 ? `${timeMs.toFixed(1)} ms` : `${(timeMs / 1000).toFixed(2)} s`;
+            }
+        }
+
+        function animatePipelineStart() {
+            resetPipeline();
+            document.getElementById('hw-status-dot').className = 'status-dot running';
+            pipeSteps.forEach(s => setPipeStep(s, '', null));
+        }
+
+        function showPipelineResults(pipeline, source) {
+            // Map backend timing keys to UI steps
+            const mapping = {
+                'features': 'feature_build_ms',
+                'mif': 'mif_patch_ms',
+                'scp': 'scp_transfer_ms',
+                'sim': 'simulation_wait_ms',
+                'decode': 'decode_bf16_ms',
+                'route': 'routing_ms',
+            };
+
+            // If PyTorch fallback, also check for pytorch_inference_ms
+            if (source === 'pytorch' && pipeline.pytorch_inference_ms) {
+                // Merge decode step with PyTorch
+                mapping['decode'] = 'pytorch_inference_ms';
+            }
+
+            pipeSteps.forEach(s => {
+                const key = mapping[s];
+                const val = pipeline[key];
+                if (val !== undefined) {
+                    setPipeStep(s, 'done', val);
+                } else if (source === 'pytorch' && (s === 'scp' || s === 'sim')) {
+                    setPipeStep(s, 'error', null);
+                    document.getElementById(`time-${s}`).textContent = 'skipped';
+                } else {
+                    setPipeStep(s, 'done', null);
+                }
+            });
+
+            document.getElementById('hw-status-dot').className = 'status-dot';
+            // Total time
+            if (pipeline.total_ms) {
+                document.getElementById('hw-status-dot').className = 'status-dot';
+            }
+        }
+
+        // ── Route Animation ─────────────────────────────────
+        function startRouteAnimation() {
+            if (routeAnimId) cancelAnimationFrame(routeAnimId);
+            function animate() {
+                routeAnimOffset = (routeAnimOffset + 1) % 200;
+                renderLayers();
+                routeAnimId = requestAnimationFrame(animate);
+            }
+            animate();
+        }
+
+        // ── Render Layers ───────────────────────────────────
         function renderLayers() {
             const activeMarkers = [...inputMarkers];
             if (startMarker) activeMarkers.push(startMarker);
@@ -187,12 +652,11 @@
                         id: 'bounding-box',
                         data: boundingBoxData,
                         pickable: false,
-                        stroked: true,
-                        filled: true,
+                        stroked: true, filled: true,
                         getPolygon: d => d.polygon,
-                        getFillColor: [0, 210, 255, 12], 
-                        getLineColor: [0, 210, 255, 150], 
-                        getLineWidth: 2,
+                        getFillColor: [0, 210, 255, 8],
+                        getLineColor: [0, 210, 255, 80],
+                        getLineWidth: 1.5,
                         lineWidthUnits: 'pixels'
                     }),
                     new HeatmapLayer({
@@ -200,27 +664,56 @@
                         data: heatmapData,
                         getPosition: d => [d.lng, d.lat],
                         getWeight: d => d.congestion,
-                        radiusPixels: 50,
-                        intensity: 2.5,
-                        threshold: 0.05
+                        radiusPixels: 55,
+                        intensity: 3,
+                        threshold: 0.04,
+                        colorRange: [
+                            [0, 0, 0, 0],
+                            [255, 255, 0, 120],
+                            [255, 140, 0, 180],
+                            [255, 50, 0, 220],
+                            [200, 0, 0, 255],
+                            [139, 0, 0, 255]
+                        ]
                     }),
                     new ScatterplotLayer({
-                        id: 'inputs', 
-                        data: activeMarkers, 
-                        getPosition: d => d.position, 
-                        getFillColor: d => d.color, 
-                        getRadius: 35, 
-                        radiusMinPixels: 6,
-                        pickable: true
+                        id: 'inputs',
+                        data: activeMarkers,
+                        getPosition: d => d.position,
+                        getFillColor: d => d.color,
+                        getRadius: 30,
+                        radiusMinPixels: 5,
+                        radiusMaxPixels: 14,
+                        pickable: true,
+                        stroked: true,
+                        getLineColor: [255, 255, 255, 120],
+                        getLineWidth: 1,
+                        lineWidthUnits: 'pixels'
                     }),
+                    // Standard route — dashed red
                     new PathLayer({
                         id: 'std-route',
                         data: stdRouteData,
                         widthMinPixels: 3,
-                        widthMaxPixels: 8,
+                        widthMaxPixels: 6,
                         getPath: d => d.path,
-                        getColor: [239, 68, 68, 180],
-                        getWidth: 4,
+                        getColor: [239, 68, 68, 160],
+                        getWidth: 3,
+                        jointRounded: true,
+                        capRounded: true,
+                        billboard: false,
+                        getDashArray: [8, 6],
+                        dashJustified: true
+                    }),
+                    // AI route — solid cyan with glow effect (wider bg layer)
+                    new PathLayer({
+                        id: 'ai-route-glow',
+                        data: aiRouteData,
+                        widthMinPixels: 10,
+                        widthMaxPixels: 20,
+                        getPath: d => d.path,
+                        getColor: [0, 210, 255, 50],
+                        getWidth: 12,
                         jointRounded: true,
                         capRounded: true,
                         billboard: false
@@ -228,11 +721,11 @@
                     new PathLayer({
                         id: 'ai-route',
                         data: aiRouteData,
-                        widthMinPixels: 5,
-                        widthMaxPixels: 14,
+                        widthMinPixels: 4,
+                        widthMaxPixels: 10,
                         getPath: d => d.path,
-                        getColor: [0, 210, 255, 255],
-                        getWidth: 7,
+                        getColor: [0, 210, 255, 240],
+                        getWidth: 5,
                         jointRounded: true,
                         capRounded: true,
                         billboard: false
@@ -241,21 +734,38 @@
             });
         }
 
+        // ── Main Prediction Call ─────────────────────────────
         async function predictETA() {
             const btn = document.getElementById('btn-predict');
-            const statusBox = document.getElementById('status');
 
             if (!startMarker || !endMarker) {
-                statusBox.innerText = "⚠️ Missing Start or End Point!";
-                statusBox.style.color = "#ef4444";
+                setStatus('Set origin and destination first.', 'var(--red)');
                 return;
             }
 
             btn.disabled = true;
-            btn.innerHTML = "⏳ Computing NPU Matrix...";
-            statusBox.innerText = "Calculating AI Matrix...";
-            statusBox.style.color = "#00d2ff";
-            document.getElementById('eta-dashboard').style.display = 'none';
+            btn.innerHTML = '<span class="spinner"></span>Running NPU inference...';
+            setStatus('Sending to NPU hardware...', 'var(--accent)');
+            document.getElementById('results').style.display = 'none';
+            document.getElementById('inference-badge').style.display = 'none';
+
+            // Animate pipeline
+            animatePipelineStart();
+
+            // Animate pipeline steps with realistic timing that mirrors
+            // the actual backend stages (MIF patch ~2ms, SCP ~0.5s, RTL sim ~30s)
+            const stepTimings = [300, 500, 1500, 5000, 35000, 38000];
+            const stepTimers = [];
+            pipeSteps.forEach((s, i) => {
+                stepTimers.push(setTimeout(() => {
+                    setPipeStep(s, 'active', null);
+                    // Update status with stage name
+                    const names = ['Building features...', 'Patching MIF...',
+                                   'Transferring to FPGA...', 'Running RTL simulation...',
+                                   'Decoding BFloat16 output...', 'Planning routes...'];
+                    setStatus(names[i], 'var(--accent)');
+                }, stepTimings[i]));
+            });
 
             const payload = {
                 custom_traffic: inputMarkers.map(m => ({ lat: m.position[1], lng: m.position[0] })),
@@ -263,50 +773,126 @@
                 end_pt: { lat: endMarker.position[1], lng: endMarker.position[0] }
             };
 
+            // Use absolute URL so the page works both when opened as a local
+            // file (file:///) and when served by the FastAPI backend (/).
+            const API_BASE = window.location.protocol === 'file:'
+                ? 'http://localhost:8000'
+                : '';
+
+            // AbortController with 3-minute timeout (RTL sim can take 60-90s)
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 180000);
+
             try {
-                const response = await fetch('http://localhost:8000/predict_route', {
-                    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
+                console.log('[NPU] Sending prediction request to', `${API_BASE}/predict_route`);
+                console.log('[NPU] Payload:', JSON.stringify(payload));
+
+                const response = await fetch(`${API_BASE}/predict_route`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                    signal: controller.signal
                 });
+
+                clearTimeout(timeoutId);
+                stepTimers.forEach(t => clearTimeout(t));
+                console.log('[NPU] Response status:', response.status, response.statusText);
 
                 if (response.ok) {
                     const data = await response.json();
-                    
+                    console.log('[NPU] Response data:', data.status, 'source:', data.inference_source);
+
+                    // Check for application-level error
+                    if (data.status === 'error') {
+                        setStatus(data.detail || 'Server returned an error.', 'var(--red)');
+                        resetPipeline();
+                        return;
+                    }
+
                     heatmapData = data.predictions || [];
-                    
-                    // FIX: Use 2-D coordinates [lng, lat] for both routes.
-                    // The previous AI route used [lng, lat, 50] — at 45° pitch that 50 m
-                    // altitude makes the path float above the map and appear to slice
-                    // diagonally across roads.  Both routes must stay on the ground plane.
+
                     if (data.travel?.std_route?.length > 0)
                         stdRouteData = [{ path: data.travel.std_route.map(p => [p.lng, p.lat]) }];
                     if (data.travel?.ai_route?.length > 0)
-                        aiRouteData  = [{ path: data.travel.ai_route.map(p => [p.lng, p.lat]) }];
+                        aiRouteData = [{ path: data.travel.ai_route.map(p => [p.lng, p.lat]) }];
 
-                    document.getElementById('eta-dashboard').style.display = 'block';
-                    document.getElementById('ai-time').innerText = `${data.travel.ai_time_min} Minutes`;
-                    document.getElementById('std-time').innerText = `${data.travel.standard_time_min} Minutes`;
+                    // Results
+                    document.getElementById('results').style.display = 'block';
+                    document.getElementById('ai-time').innerHTML =
+                        `${data.travel.ai_time_min}<span class="metric-unit"> min</span>`;
+                    document.getElementById('std-time').innerHTML =
+                        `${data.travel.standard_time_min}<span class="metric-unit"> min</span>`;
+
+                    // Savings banner
+                    if (data.time_savings_pct > 0) {
+                        document.getElementById('savings-banner').style.display = 'flex';
+                        document.getElementById('savings-text').textContent =
+                            `${data.time_savings_pct}% faster with AI route`;
+                    } else {
+                        document.getElementById('savings-banner').style.display = 'none';
+                    }
+
+                    // Inference badge
+                    const badge = document.getElementById('inference-badge');
+                    badge.style.display = 'flex';
+                    if (data.inference_source === 'npu') {
+                        badge.className = 'inference-badge npu';
+                        document.getElementById('badge-icon').textContent = '⚡';
+                        document.getElementById('badge-text').textContent = 'NPU Hardware Inference';
+                    } else {
+                        badge.className = 'inference-badge pytorch';
+                        document.getElementById('badge-icon').textContent = '🧠';
+                        document.getElementById('badge-text').textContent = 'PyTorch Fallback';
+                    }
+
+                    // Pipeline telemetry
+                    if (data.pipeline) {
+                        showPipelineResults(data.pipeline, data.inference_source);
+                    }
 
                     triggerRender();
-                    const src = data.inference_source === 'npu' ? '⚡ NPU' : '🧠 PyTorch';
+
+                    // Status
+                    const src = data.inference_source === 'npu' ? 'NPU' : 'PyTorch';
+                    const total = data.pipeline?.total_ms
+                        ? ` (${(data.pipeline.total_ms / 1000).toFixed(1)}s)`
+                        : '';
                     const routeOk = !data.routing_status || data.routing_status === 'ok';
+
                     if (routeOk) {
-                        statusBox.innerText = `Prediction Complete! [${src}]`;
-                        statusBox.style.color = "#10b981";
+                        setStatus(`Complete — ${src} inference${total}`, 'var(--green)');
                     } else {
-                        // Routing fell back to haversine straight-line estimate
-                        statusBox.innerText = `Heatmap ready [${src}] — route estimate only (no map path)`;
-                        statusBox.style.color = "#f59e0b";
+                        setStatus(`Heatmap ready [${src}] — route is estimated`, 'var(--amber)');
                     }
                 } else {
-                    statusBox.innerText = "Error: Failed to process route.";
-                    statusBox.style.color = "#ef4444";
+                    // Try to extract error detail from response body
+                    let detail = `Server error (HTTP ${response.status})`;
+                    try {
+                        const errText = await response.text();
+                        console.error('[NPU] Server error body:', errText);
+                        try {
+                            const errData = JSON.parse(errText);
+                            if (errData.detail) detail = `Server error: ${typeof errData.detail === 'string' ? errData.detail : JSON.stringify(errData.detail)}`;
+                        } catch(_) {
+                            detail += ': ' + errText.slice(0, 200);
+                        }
+                    } catch(_) {}
+                    stepTimers.forEach(t => clearTimeout(t));
+                    setStatus(detail, 'var(--red)');
                 }
             } catch (error) {
-                statusBox.innerText = "Backend Connection Error.";
-                statusBox.style.color = "#ef4444";
+                clearTimeout(timeoutId);
+                stepTimers.forEach(t => clearTimeout(t));
+                console.error('[NPU] Fetch error:', error);
+                if (error.name === 'AbortError') {
+                    setStatus('Request timed out (3 min). RTL simulation may still be running.', 'var(--amber)');
+                } else {
+                    setStatus(`Network error: ${error.message}`, 'var(--red)');
+                }
+                resetPipeline();
             } finally {
                 btn.disabled = false;
-                btn.innerHTML = "🚀 Calculate ETA";
+                btn.innerHTML = 'Run NPU Inference';
             }
         }
     </script>
