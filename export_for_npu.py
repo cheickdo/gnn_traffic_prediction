@@ -25,12 +25,21 @@ w_head_q = quantize_int8(np.pad(w_head, ((0, 31), (0, 0)), mode='constant'))
 
 print("Extracting Graph Topology...")
 dataset = load_toronto_traffic_data()
+edge_index = dataset.edge_index
+edges_src = edge_index[0].numpy()
+edges_dest = edge_index[1].numpy()
 
-# THE FIX: dataset.edge_index is already a numpy array
-edges_src = dataset.edge_index[0]
-edges_dest = dataset.edge_index[1]
+# 1. Create a standard input state (Free Flowing Traffic)
+num_nodes = len(dataset.features[0].edge_index[0]) # Get actual node count
+current_state = np.ones((num_nodes, 7), dtype=np.float32)
+x_tensor = torch.tensor(current_state)
 
-# Dump everything to a static, hardware-ready bundle
+# 2. Run PyTorch to get the Golden Reference
+print("Calculating PyTorch Golden Output...")
+with torch.no_grad():
+    golden_out = model(x_tensor, edge_index).numpy()
+
+# Pack everything into the bundle
 np.savez(
     "toronto_npu_export.npz",
     edges_src=edges_src,
@@ -38,6 +47,8 @@ np.savez(
     w0_q=w0_q,
     w1_q=w1_q,
     w2_q=w2_q,
-    w_head_q=w_head_q
+    w_head_q=w_head_q,
+    x_in=current_state,       
+    golden_out=golden_out     
 )
-print("✅ Exported toronto_npu_export.npz!")
+print("✅ Exported toronto_npu_export.npz with Golden Reference!")

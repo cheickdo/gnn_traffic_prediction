@@ -26,6 +26,25 @@ BASE_SPEED_MS = DEFAULT_SPEED_KMH * 1000.0 / 3600.0
 OSM_BBOX = (-79.395, 43.643, -79.370, 43.658)
 
 import struct
+import subprocess
+
+def transfer_mif_to_remote(local_path="compiler/input.mif"):
+    """
+    Pushes the newly generated input.mif file to the remote EDA server via SCP.
+    Assumes SSH keys are configured for passwordless entry.
+    """
+    remote_user = "doumbiac"
+    remote_host = "betzgrp-wintermute.eecg.utoronto.ca"
+    remote_dir = "~/Documents/npu_gnn_bringup/rtl/mif_files/"
+    remote_target = f"{remote_user}@{remote_host}:{remote_dir}"
+    
+    print(f"🚀 Transferring {local_path} to remote server...")
+    try:
+        # Use subprocess to execute the SCP command
+        subprocess.run(["scp", local_path, remote_target], check=True)
+        print("✅ Transfer complete.")
+    except subprocess.CalledProcessError as e:
+        print(f"❌ SCP transfer failed: {e}")
 
 def hex_to_bfloat16_float(hex_str):
     """Converts a 4-character hex string (BFloat16) back to a standard Float32."""
@@ -300,9 +319,8 @@ async def predict_full_map(req: RouteRequest):
         current_state[node_idx, 0:4] = 0.1 
         bottleneck_indices.append(node_idx)
 
-    '''
-    sim_done_path = "simulator/sim_done"
-    out_file_path = "simulator/out_file" 
+    sim_done_path = "sim_done"
+    out_file_path = "out_file" 
     
     if os.path.exists(sim_done_path): os.remove(sim_done_path)
     if os.path.exists(out_file_path): os.remove(out_file_path)
@@ -313,10 +331,14 @@ async def predict_full_map(req: RouteRequest):
     patch_npu_mif(
         current_state, 
         edge_index.cpu().numpy(), 
-        template_path="compiler/input_template.mif", 
-        output_path="compiler/input.mif"
+        template_path="input_template.mif", 
+        output_path="input.mif"
     )
     print("Patched input.mif. Waiting for external NPU simulation...")
+    
+    # PUSH TO REMOTE SERVER
+    transfer_mif_to_remote("input.mif")
+    print("Waiting for remote NPU simulation...")
 
     # ---------------------------------------------------------
     # 3. ASYNCHRONOUS WAIT LOOP (Listen for sim_done)
@@ -324,22 +346,40 @@ async def predict_full_map(req: RouteRequest):
     timeout_seconds = 120.0
     elapsed = 0.0
     
-    while not os.path.exists(sim_done_path):
-        await asyncio.sleep(0.1) # Yields control so the web server doesn't freeze
-        elapsed += 0.1
-        if elapsed >= timeout_seconds:
-            print("Simulation timeout!")
-            return {"error": "Hardware simulation timed out after 60 seconds."}
-
-    # Add a tiny 100ms buffer to ensure the OS has finished flushing out_file to disk
-    await asyncio.sleep(0.1)
-    print("Detected sim_done! Decoding Silicon Output...")
-
-    # ---------------------------------------------------------
-    # 4. EXTRACT AND DECODE THE SILICON OUTPUT
-    # ---------------------------------------------------------
-    npu_preds_numpy = parse_raw_hex_output(out_file_path, num_nodes=num_nodes)
+    remote_sim_done = "doumbiac@betzgrp-wintermute.eecg.utoronto.ca:~/Documents/npu_gnn_bringup/rtl/sim_done"
+    remote_out_file = "doumbiac@betzgrp-wintermute.eecg.utoronto.ca:~/Documents/npu_gnn_bringup/rtl/out_file"
+    local_out_file = "out_file"
     
+    simulation_finished = False
+
+    while elapsed < timeout_seconds:
+        # Check if the sim_done file exists on the remote machine
+        # 'ssh' returns exit code 0 if the file exists (using 'test -f')
+        check_cmd = ["ssh", "doumbiac@betzgrp-wintermute.eecg.utoronto.ca", "test", "-f", "~/Documents/npu_gnn_bringup/rtl/sim_done"]
+        result = subprocess.run(check_cmd)
+        
+        if result.returncode == 0:
+            simulation_finished = True
+            break
+            
+        await asyncio.sleep(0.5) # Yield control to the web server
+        elapsed += 0.5
+
+    if not simulation_finished:
+        return {"error": "Hardware simulation timed out after 150 seconds."}
+
+    # ---------------------------------------------------------
+    # 4. FETCH AND DECODE THE SILICON OUTPUT
+    # ---------------------------------------------------------
+    print("Detected remote sim_done! Fetching Silicon Output...")
+    try:
+        # Pull the out_file back from the server
+        subprocess.run(["scp", remote_out_file, local_out_file], check=True)
+    except subprocess.CalledProcessError:
+        return {"error": "Failed to retrieve the simulation output from the remote server."}
+
+    npu_preds_numpy = parse_raw_hex_output(local_out_file, num_nodes=num_nodes)
+
     # Optional: If you haven't implemented Sigmoid in the C++ MFU yet, do it in Python here:
     # npu_preds_numpy = 1 / (1 + np.exp(-npu_preds_numpy))
 
@@ -353,8 +393,8 @@ async def predict_full_map(req: RouteRequest):
 
     all_ratios = pred_ratio.squeeze().cpu().numpy()
     travel_data = {"standard_time_min": 0, "ai_time_min": 0, "std_route": [], "ai_route": []}
-    '''
 
+    '''
     x = torch.tensor(current_state).to(device)
     #np.save("x_array_dump.npy", x.detach().cpu().numpy())
 
@@ -367,7 +407,7 @@ async def predict_full_map(req: RouteRequest):
 
     all_ratios = pred_ratio.squeeze().cpu().numpy()
     travel_data = {"standard_time_min": 0, "ai_time_min": 0, "std_route": [], "ai_route": []}
-
+    '''
     if req.start_pt and req.end_pt and osm_graph is not None:
         import osmnx as ox
         orig = int(ox.distance.nearest_nodes(osm_graph, req.start_pt.lng, req.start_pt.lat))
