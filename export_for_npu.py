@@ -1,31 +1,45 @@
 """
 export_for_npu.py — Export trained PyTorch GNN to NPU hardware format.
 
-Generates `toronto_npu_export.npz` containing:
-  - Float32 GCN layer weights padded to 32 lanes (w0_q, w1_q, w2_q)
-  - Float32 prediction head padded to 32×32 (w_head_q)
-  - Graph topology with self-loops (edges_src, edges_dest)
-  - GCN normalization edge scalars (edge_scalar)
-  - Default input tensor (x_in)
-  - Golden reference output from PyTorch (golden_out)
+The Stratix 10 NX RTL uses INT8 weights in the MRF (matrix register file)
+multiplied with BFloat16 activations in the VRF.  The compiler enforces
+weight_data_type = np.int8.
 
-CRITICAL FIX: The Intel Stratix 10 NX has BFloat16 tensor blocks, NOT
-INT8 ALUs.  Previous INT8 quantization caused values like 0.5 to be
-stored as 127.0 — ~254× too large.  After 3 GCN layers the outputs
-explode to ~40000, explaining the "all same output" bug.
+The INT8 values are used AS-IS by the hardware — there is no scale factor.
+INT8 value 4 means the hardware multiplies by 4.0.
 
-Now exports weights as float32 (which the hardware truncates to BFloat16
-natively).  Array names are kept as *_q for backward compatibility with
-the compiler driver.
-
-Self-loops are added to the edge list, matching PyTorch GCNConv's
-default `add_self_loops=True` behaviour.
+QUANTIZATION STRATEGY:
+  Per-row quantization with max_int=8 maps each weight matrix row's
+  largest absolute value to ±8.  This:
+    - Matches the working 26_gcn5_100_latency.py pattern (weights [0,4])
+    - Keeps dot products bounded (32 lanes × max 8 = 256 per layer)
+    - Prevents overflow after 3 GCN layers with normalization
+    - Preserves relative weight structure within each row
 """
 
 import numpy as np
 import torch
 from model import TrafficPredictorGNN
 from data_loader import load_toronto_traffic_data
+
+
+MAX_INT = 8  # Target max int8 value — keep small to prevent overflow
+
+
+def quantize_per_row(w: np.ndarray, max_int: int = MAX_INT) -> np.ndarray:
+    """Per-row symmetric INT8 quantization.
+
+    Each row's largest absolute value maps to ±max_int.
+    This preserves relative structure within each row while keeping
+    values in a hardware-safe range.
+    """
+    w_q = np.zeros_like(w, dtype=np.int8)
+    for r in range(w.shape[0]):
+        row_max = np.max(np.abs(w[r]))
+        if row_max > 0:
+            scale = row_max / max_int
+            w_q[r] = np.clip(np.round(w[r] / scale), -128, 127).astype(np.int8)
+    return w_q
 
 
 def main():
@@ -50,30 +64,26 @@ def main():
     print(f"  head:  {w_head.shape}")
 
     # ------------------------------------------------------------------
-    # 2. Pad weights to 32-wide hardware vector lanes (FLOAT32, NOT INT8)
+    # 2. Pad and quantize weights to INT8 (per-row, max_int={MAX_INT})
     # ------------------------------------------------------------------
-    # The Stratix 10 NX computes in BFloat16.  Feeding INT8 integers
-    # (range -128..127) directly causes ~200× weight inflation and
-    # numerical explosion after multiple GCN layers.
-    #
-    # We export the raw float32 weights; the NPU hardware truncates
-    # them to BFloat16 when loaded into the MRF tiles.
-    print("\n[2/5] Padding weights to 32 lanes (float32 for BFloat16 hardware)...")
+    print(f"\n[2/5] Quantizing weights (per-row, max_int={MAX_INT})...")
 
-    # Layer 1: input is 7 features → pad columns from 7 to 32
-    w0_q = np.pad(w0, ((0, 0), (0, 32 - 7)), mode="constant").astype(np.float32)
+    # Layer 1: (32, 7) → pad to (32, 32)
+    w0_padded = np.pad(w0, ((0, 0), (0, 32 - 7)), mode="constant")
+    w0_q = quantize_per_row(w0_padded)
 
-    # Layers 2-3: already 32×32
-    w1_q = w1.astype(np.float32)
-    w2_q = w2.astype(np.float32)
+    # Layers 2-3: already (32, 32)
+    w1_q = quantize_per_row(w1)
+    w2_q = quantize_per_row(w2)
 
-    # Prediction head: (1, 32) → pad rows from 1 to 32
-    # Only row 0 carries the real weights; rows 1–31 are zero.
-    # Lane 0 of the NPU output holds the actual prediction.
-    w_head_q = np.pad(w_head, ((0, 31), (0, 0)), mode="constant").astype(np.float32)
+    # Head: (1, 32) → pad to (32, 32)
+    w_head_padded = np.pad(w_head, ((0, 31), (0, 0)), mode="constant")
+    w_head_q = quantize_per_row(w_head_padded)
 
     for name, wq in [("w0_q", w0_q), ("w1_q", w1_q), ("w2_q", w2_q), ("w_head_q", w_head_q)]:
-        print(f"  {name}: {wq.shape}  range=[{wq.min():.4f}, {wq.max():.4f}]")
+        nz = np.count_nonzero(wq)
+        print(f"  {name}: {wq.shape}  range=[{wq.min()}, {wq.max()}]  "
+              f"nonzero={nz}/{wq.size} ({100*nz/wq.size:.0f}%)")
 
     # ------------------------------------------------------------------
     # 3. Extract graph topology and ADD SELF-LOOPS
@@ -91,10 +101,6 @@ def main():
 
     print(f"  Original graph: {num_nodes} nodes, {num_edges_orig} edges")
 
-    # ------ CRITICAL FIX: ADD SELF-LOOPS ------
-    # PyTorch Geometric GCNConv has add_self_loops=True by default.
-    # The GCN formula is: h' = D̂^(-½) Â D̂^(-½) X W
-    # where Â = A + I (adjacency + identity = self-loops).
     self_loop_nodes = np.arange(num_nodes, dtype=np.int64)
     edges_src = np.concatenate([edges_src_orig, self_loop_nodes])
     edges_dest = np.concatenate([edges_dest_orig, self_loop_nodes])
@@ -103,55 +109,45 @@ def main():
     print(f"  + {num_nodes} self-loops → {num_edges} total edges")
 
     # ------------------------------------------------------------------
-    # 4. Compute GCN edge scalars
+    # 4. Edge scalars
     # ------------------------------------------------------------------
     edge_scalar = np.ones(num_edges, dtype=np.float32)
 
     # ------------------------------------------------------------------
-    # 5. Generate golden reference output
+    # 5. Golden reference output
     # ------------------------------------------------------------------
     print("\n[4/5] Computing PyTorch golden reference output...")
-
     current_state = np.ones((num_nodes, 7), dtype=np.float32)
     x_tensor = torch.tensor(current_state, dtype=torch.float32)
-
     edge_index_torch = torch.tensor(np.asarray(edge_index), dtype=torch.long)
     with torch.no_grad():
         golden_out = model(x_tensor, edge_index_torch).numpy()
 
-    print(f"  Golden output: shape={golden_out.shape}")
-    print(f"  Range: [{golden_out.min():.4f}, {golden_out.max():.4f}]")
-    print(f"  Mean:  {golden_out.mean():.4f}  Std: {golden_out.std():.4f}")
+    print(f"  Golden output: range=[{golden_out.min():.4f}, {golden_out.max():.4f}]  "
+          f"mean={golden_out.mean():.4f}  std={golden_out.std():.4f}")
 
     # ------------------------------------------------------------------
-    # 6. Save export bundle
+    # 6. Save
     # ------------------------------------------------------------------
     print("\n[5/5] Saving toronto_npu_export.npz...")
     np.savez(
         "toronto_npu_export.npz",
-        # Weights (float32 — array names kept as *_q for compatibility)
         w0_q=w0_q,
         w1_q=w1_q,
         w2_q=w2_q,
         w_head_q=w_head_q,
-        # Topology (WITH self-loops)
         edges_src=edges_src,
         edges_dest=edges_dest,
         edge_scalar=edge_scalar,
-        # Reference data
         x_in=current_state,
         golden_out=golden_out,
     )
 
     print(f"\n{'=' * 60}")
     print(f"  Export complete: toronto_npu_export.npz")
-    print(f"  Nodes: {num_nodes}  Edges: {num_edges} (incl. {num_nodes} self-loops)")
-    print(f"  Weights: float32 (BFloat16-native), 32-wide vector lanes")
+    print(f"  Nodes: {num_nodes}  Edges: {num_edges}")
+    print(f"  Weights: INT8 per-row quantized, max_int={MAX_INT}")
     print(f"{'=' * 60}")
-    print(f"\n  Next steps:")
-    print(f"  1. Copy toronto_npu_export.npz to the compiler directory")
-    print(f"  2. Run: python driver_toronto_npu.py <npu_args>")
-    print(f"  3. This generates input_template.mif for the RTL simulator")
 
 
 if __name__ == "__main__":
