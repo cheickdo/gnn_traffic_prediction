@@ -7,7 +7,7 @@ from data_loader import load_toronto_traffic_data
 LEARNING_RATE = 0.01
 EPOCHS = 50 
 HIDDEN_DIM = 32
-NODE_FEATURES = 1 
+NODE_FEATURES = 7 
 
 # --- 2. Hardware Acceleration ---
 # Automatically detects your NVIDIA GPU (CUDA)

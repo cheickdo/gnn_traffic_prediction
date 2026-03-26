@@ -9,40 +9,64 @@
     <style>
         body { margin: 0; padding: 0; font-family: 'Segoe UI', system-ui, sans-serif; background: #0b0f19; overflow: hidden; color: #fff; }
         #map { width: 100vw; height: 100vh; position: absolute; top: 0; left: 0; }
-        #panel { position: absolute; top: 20px; left: 20px; background: rgba(15, 20, 35, 0.95); padding: 25px; border-radius: 12px; border: 1px solid #334; z-index: 10; width: 340px; box-shadow: 0 10px 40px rgba(0,0,0,0.9); backdrop-filter: blur(10px); }
+        
+        #panel { position: absolute; top: 20px; left: 20px; background: rgba(15, 20, 35, 0.85); padding: 25px; border-radius: 12px; border: 1px solid rgba(255,255,255,0.1); z-index: 10; width: 340px; box-shadow: 0 10px 40px rgba(0,0,0,0.8); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); transition: all 0.3s ease; }
+        
         h2 { margin: 0 0 5px 0; font-size: 20px; color: #00d2ff; }
         p { color: #8892b0; font-size: 13px; margin-bottom: 20px; line-height: 1.5; }
+        
         .tools { display: grid; grid-template-columns: 1fr; gap: 8px; margin-bottom: 20px; }
-        button { padding: 12px; font-size: 14px; cursor: pointer; background: #1e293b; color: #fff; border: 1px solid #475569; border-radius: 6px; font-weight: 600; transition: 0.2s; text-align: left;}
-        button:hover { background: #334155; }
-        button.active { background: #00d2ff; color: #000; border-color: #00d2ff; }
         
-        .btn-predict { width: 100%; background: #10b981; color: #000; border: none; font-size: 16px; padding: 15px; text-align: center; margin-bottom: 10px; }
-        .btn-predict:hover { background: #059669; box-shadow: 0 0 15px rgba(16, 185, 129, 0.4); }
+        button { padding: 12px; font-size: 14px; cursor: pointer; background: #1e293b; color: #fff; border: 1px solid #475569; border-radius: 6px; font-weight: 600; transition: all 0.15s cubic-bezier(0.4, 0, 0.2, 1); text-align: left;}
+        button:hover:not(:disabled) { background: #334155; transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0,0,0,0.2); }
+        button:active:not(:disabled) { transform: translateY(1px); }
+        button.active { background: rgba(0, 210, 255, 0.15); color: #00d2ff; border-color: #00d2ff; box-shadow: inset 0 0 0 1px #00d2ff; }
+        
+        .btn-predict { width: 100%; background: #10b981; color: #000; border: none; font-size: 16px; padding: 15px; text-align: center; margin-bottom: 10px; transition: all 0.2s ease; }
+        .btn-predict:hover:not(:disabled) { background: #059669; box-shadow: 0 0 20px rgba(16, 185, 129, 0.4); }
+        .btn-predict:disabled { background: #334155; color: #94a3b8; cursor: not-allowed; transform: none; box-shadow: none; }
+        
         .btn-clear { width: 100%; background: transparent; border: 1px dashed #64748b; color: #94a3b8; text-align: center; }
+        .btn-clear:hover { border-color: #ef4444; color: #ef4444; background: rgba(239, 68, 68, 0.1); }
         
-        #eta-dashboard { display: none; margin-top: 20px; padding: 15px; background: rgba(0,0,0,0.5); border-radius: 8px; border: 1px solid #334; }
+        @keyframes slideUpFade {
+            from { opacity: 0; transform: translateY(15px) scale(0.98); }
+            to { opacity: 1; transform: translateY(0) scale(1); }
+        }
+        
+        #eta-dashboard { display: none; margin-top: 20px; padding: 18px; background: rgba(0,0,0,0.4); border-radius: 8px; border: 1px solid rgba(255,255,255,0.05); box-shadow: inset 0 2px 10px rgba(0,0,0,0.2); animation: slideUpFade 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards; }
         .eta-title { font-size: 11px; color: #94a3b8; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 5px; }
-        .eta-value { font-size: 32px; font-weight: bold; color: #00d2ff; margin-bottom: 15px; }
-        .eta-sub { font-size: 14px; color: #ef4444; }
+        .eta-value { font-size: 36px; font-weight: 800; color: #00d2ff; margin-bottom: 15px; text-shadow: 0 0 20px rgba(0, 210, 255, 0.4); }
+        .eta-sub { font-size: 14px; color: #ef4444; font-weight: 600;}
         
-        #status { margin-top: 15px; font-size: 12px; color: #10b981; text-align: center; }
+        #status { margin-top: 15px; font-size: 12px; color: #10b981; text-align: center; font-family: monospace; }
+        
+        #tooltip { position: absolute; z-index: 999; pointer-events: none; display: none; background: rgba(15, 20, 35, 0.95); padding: 8px 12px; border: 1px solid #475569; border-radius: 6px; color: #fff; font-size: 12px; font-family: monospace; box-shadow: 0 4px 15px rgba(0,0,0,0.5); backdrop-filter: blur(4px); transform: translate(-50%, -120%); white-space: nowrap;}
+        
+        .legend-dot { display: inline-block; width: 10px; height: 10px; background: rgba(0, 210, 255, 0.2); border: 1px solid #00d2ff; margin-right: 5px; vertical-align: middle; }
     </style>
 </head>
 <body>
     <div id="map"></div>
+    <div id="tooltip"></div>
+    
     <div id="panel">
         <h2>AI ETA Engine</h2>
-        <p>NPU spatial matrix prediction for real-time dynamic pathfinding.</p>
+        <p>
+            NPU spatial matrix prediction for real-time dynamic pathfinding.<br>
+            <span style="font-size: 11px; color: #94a3b8; display: block; margin-top: 8px;">
+                <span class="legend-dot"></span>Valid AI Training Zone
+            </span>
+        </p>
         
         <div class="tools">
-            <button id="btn-jam" class="active" onclick="setMode('jam')">🚧 1. Draw Congestion</button>
+            <button id="btn-jam" class="active" onclick="setMode('jam')">🚧 1. Draw Congestion (Hold Shift)</button>
             <button id="btn-start" onclick="setMode('start')">🟢 2. Set Origin</button>
             <button id="btn-end" onclick="setMode('end')">🔴 3. Set Destination</button>
         </div>
         
-        <button class="btn-predict" onclick="predictETA()">🚀 Calculate ETA</button>
-        <button class="btn-clear" onclick="clearMap()">Reset Map</button>
+        <button id="btn-predict" class="btn-predict" onclick="predictETA()">🚀 Calculate ETA</button>
+        <button class="btn-clear" onclick="clearMap()">🗑️ Reset Map</button>
         
         <div id="eta-dashboard">
             <div class="eta-title">AI Smart Route (Detour)</div>
@@ -56,7 +80,7 @@
     </div>
 
     <script>
-        const {DeckGL, PathLayer, ScatterplotLayer, HeatmapLayer} = deck;
+        const {DeckGL, PathLayer, ScatterplotLayer, HeatmapLayer, PolygonLayer} = deck;
 
         let currentMode = 'jam';
         let inputMarkers = [];
@@ -67,18 +91,71 @@
         let aiRouteData = [];
         let stdRouteData = [];
 
+        const tooltip = document.getElementById('tooltip');
+
+        // FIXED: The polygon ring is now explicitly closed to prevent WebGL validation errors
+        const boundingBoxData = [{
+            polygon: [
+                [-79.395, 43.643], 
+                [-79.395, 43.658], 
+                [-79.370, 43.658], 
+                [-79.370, 43.643],
+                [-79.395, 43.643] // Explicit closing coordinate
+            ]
+        }];
+
+        let isRenderPending = false;
+        
+        function triggerRender() {
+            if (!isRenderPending) {
+                isRenderPending = true;
+                requestAnimationFrame(() => {
+                    renderLayers();
+                    isRenderPending = false;
+                });
+            }
+        }
+
         const deckgl = new DeckGL({
             container: 'map',
             mapStyle: 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json',
-            initialViewState: { longitude: -79.3832, latitude: 43.655, zoom: 13.5, pitch: 45, bearing: -10 },
+            initialViewState: { longitude: -79.382, latitude: 43.650, zoom: 14, pitch: 45, bearing: -10 },
             controller: true,
-            onClick: (info) => handleMapClick(info.coordinate)
+            onClick: (info) => handleMapClick(info.coordinate),
+            onHover: (info) => handleHover(info),
+            // FIXED: Native DeckGL lifecycle hook instead of invalid .on() event listener
+            onLoad: () => triggerRender() 
         });
+
+        let isShiftDown = false;
+        window.addEventListener('keydown', e => { if (e.key === 'Shift') isShiftDown = true; });
+        window.addEventListener('keyup', e => { if (e.key === 'Shift') isShiftDown = false; });
 
         function setMode(mode) {
             currentMode = mode;
             ['jam', 'start', 'end'].forEach(m => document.getElementById(`btn-${m}`).classList.remove('active'));
             document.getElementById(`btn-${mode}`).classList.add('active');
+        }
+
+        function handleHover(info) {
+            if (info.object && info.layer.id === 'inputs') {
+                tooltip.style.display = 'block';
+                tooltip.style.left = `${info.x}px`;
+                tooltip.style.top = `${info.y}px`;
+                tooltip.innerHTML = `📍 Node<br>Lat: ${info.coordinate[1].toFixed(4)}<br>Lng: ${info.coordinate[0].toFixed(4)}`;
+            } else {
+                tooltip.style.display = 'none';
+            }
+
+            if (isShiftDown && currentMode === 'jam' && info.coordinate) {
+                const [lng, lat] = info.coordinate;
+                const lastMarker = inputMarkers[inputMarkers.length - 1];
+                
+                if (!lastMarker || Math.abs(lastMarker.position[0] - lng) > 0.0005 || Math.abs(lastMarker.position[1] - lat) > 0.0005) {
+                    inputMarkers.push({ position: [lng, lat], color: [255, 50, 50] });
+                    triggerRender();
+                }
+            }
         }
 
         function handleMapClick(coords) {
@@ -87,7 +164,7 @@
             if (currentMode === 'jam') inputMarkers.push({ position: [lng, lat], color: [255, 50, 50] });
             else if (currentMode === 'start') startMarker = { position: [lng, lat], color: [16, 185, 129] };
             else if (currentMode === 'end') endMarker = { position: [lng, lat], color: [139, 92, 246] };
-            renderLayers();
+            triggerRender();
         }
 
         function clearMap() {
@@ -95,47 +172,79 @@
             heatmapData = []; aiRouteData = []; stdRouteData = [];
             document.getElementById('eta-dashboard').style.display = 'none';
             document.getElementById('status').innerText = "Map cleared.";
-            renderLayers();
+            document.getElementById('status').style.color = "#94a3b8";
+            triggerRender();
         }
 
         function renderLayers() {
+            const activeMarkers = [...inputMarkers];
+            if (startMarker) activeMarkers.push(startMarker);
+            if (endMarker) activeMarkers.push(endMarker);
+
             deckgl.setProps({
                 layers: [
-                    // Heatmap replaces the 3D columns for a sleeker "Traffic Radar" look
+                    new PolygonLayer({
+                        id: 'bounding-box',
+                        data: boundingBoxData,
+                        pickable: false,
+                        stroked: true,
+                        filled: true,
+                        getPolygon: d => d.polygon,
+                        getFillColor: [0, 210, 255, 12], 
+                        getLineColor: [0, 210, 255, 150], 
+                        getLineWidth: 2,
+                        lineWidthUnits: 'pixels'
+                    }),
                     new HeatmapLayer({
                         id: 'congestion-heat',
                         data: heatmapData,
                         getPosition: d => [d.lng, d.lat],
                         getWeight: d => d.congestion,
-                        radiusPixels: 40,
-                        intensity: 2,
-                        threshold: 0.1,
-                        colorRange: [ [255, 204, 0, 50], [255, 100, 0, 150], [255, 0, 0, 255] ]
+                        radiusPixels: 50,
+                        intensity: 2.5,
+                        threshold: 0.05
                     }),
                     new ScatterplotLayer({
-                        id: 'inputs', data: [...inputMarkers, startMarker, endMarker].filter(Boolean),
-                        getPosition: d => d.position, getFillColor: d => d.color, getRadius: 35, radiusMinPixels: 6
+                        id: 'inputs', 
+                        data: activeMarkers, 
+                        getPosition: d => d.position, 
+                        getFillColor: d => d.color, 
+                        getRadius: 35, 
+                        radiusMinPixels: 6,
+                        pickable: true
                     }),
                     new PathLayer({
-                        id: 'std-route', data: stdRouteData, widthScale: 4, widthMinPixels: 3,
-                        getPath: d => d.path, getColor: [239, 68, 68, 200], getWidth: 2, // Red line driving into traffic
-                        dashJustified: true, getDashArray: [4, 2] 
+                        id: 'std-route', 
+                        data: stdRouteData, 
+                        widthScale: 4, widthMinPixels: 3,
+                        getPath: d => d.path, getColor: [239, 68, 68, 200], getWidth: 2
                     }),
                     new PathLayer({
-                        id: 'ai-route', data: aiRouteData, widthScale: 4, widthMinPixels: 6,
-                        getPath: d => d.path, getColor: [0, 210, 255, 255], getWidth: 4 // Thick blue detour
+                        id: 'ai-route', 
+                        data: aiRouteData, 
+                        widthScale: 4, widthMinPixels: 6,
+                        getPath: d => d.path, getColor: [0, 210, 255, 255], getWidth: 4
                     })
                 ]
             });
         }
 
         async function predictETA() {
+            const btn = document.getElementById('btn-predict');
+            const statusBox = document.getElementById('status');
+
             if (!startMarker || !endMarker) {
-                document.getElementById('status').innerText = "⚠️ Missing Start or End Point!";
+                statusBox.innerText = "⚠️ Missing Start or End Point!";
+                statusBox.style.color = "#ef4444";
                 return;
             }
 
-            document.getElementById('status').innerText = "Calculating AI Matrix...";
+            btn.disabled = true;
+            btn.innerHTML = "⏳ Computing NPU Matrix...";
+            statusBox.innerText = "Calculating AI Matrix...";
+            statusBox.style.color = "#00d2ff";
+            document.getElementById('eta-dashboard').style.display = 'none';
+
             const payload = {
                 custom_traffic: inputMarkers.map(m => ({ lat: m.position[1], lng: m.position[0] })),
                 start_pt: { lat: startMarker.position[1], lng: startMarker.position[0] },
@@ -150,20 +259,29 @@
                 if (response.ok) {
                     const data = await response.json();
                     
-                    heatmapData = data.predictions;
-                    if (data.travel.std_route.length > 0) stdRouteData = [{ path: data.travel.std_route.map(p => [p.lng, p.lat]) }];
-                    if (data.travel.ai_route.length > 0) aiRouteData = [{ path: data.travel.ai_route.map(p => [p.lng, p.lat, 50]) }];
+                    heatmapData = data.predictions || [];
+                    
+                    // FIXED: Optional chaining to prevent deep access crashes if paths fail to generate
+                    if (data.travel?.std_route?.length > 0) stdRouteData = [{ path: data.travel.std_route.map(p => [p.lng, p.lat]) }];
+                    if (data.travel?.ai_route?.length > 0) aiRouteData = [{ path: data.travel.ai_route.map(p => [p.lng, p.lat, 50]) }];
 
-                    // Update Dashboard
                     document.getElementById('eta-dashboard').style.display = 'block';
                     document.getElementById('ai-time').innerText = `${data.travel.ai_time_min} Minutes`;
                     document.getElementById('std-time').innerText = `${data.travel.standard_time_min} Minutes`;
                     
-                    renderLayers();
-                    document.getElementById('status').innerText = "Prediction Complete!";
+                    triggerRender();
+                    statusBox.innerText = "Prediction Complete!";
+                    statusBox.style.color = "#10b981";
+                } else {
+                    statusBox.innerText = "Error: Failed to process route.";
+                    statusBox.style.color = "#ef4444";
                 }
             } catch (error) {
-                document.getElementById('status').innerText = "Backend Connection Error.";
+                statusBox.innerText = "Backend Connection Error.";
+                statusBox.style.color = "#ef4444";
+            } finally {
+                btn.disabled = false;
+                btn.innerHTML = "🚀 Calculate ETA";
             }
         }
     </script>
